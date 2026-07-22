@@ -868,7 +868,7 @@ export OPENAI_API_KEY="your-api-key"
 export OPENAI_MODEL="your-model"
 ```
 
-不要把真实 API Key 写入 README、源码或提交记录。曾经在聊天、日志或截图中暴露的密钥应立即轮换。
+不要把真实 API Key 写入 README、源码或提交记录。
 
 ---
 
