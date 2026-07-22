@@ -1,0 +1,42 @@
+{
+  "document_stats": {
+    "document": "enterprise_research_128k.md",
+    "bytes": 572535,
+    "estimated_tokens": 177420,
+    "physical_context_reference": 65536,
+    "exceeds_64kb_bytes": true,
+    "exceeds_64k_estimated_tokens": true
+  },
+  "cases": [
+    {
+      "id": "needle_beginning",
+      "question": "本次长上下文测试的唯一有效项目代号是什么？",
+      "expected_terms": [
+        "青峦-7429"
+      ]
+    },
+    {
+      "id": "needle_middle",
+      "question": "中期验收口令是什么？",
+      "expected_terms": [
+        "银杏-5813"
+      ]
+    },
+    {
+      "id": "needle_end",
+      "question": "用于确认文档末部信息的最终归档校验值是什么？",
+      "expected_terms": [
+        "HF-90617-Z"
+      ]
+    },
+    {
+      "id": "multi_hop_all_positions",
+      "question": "请同时给出唯一有效项目代号、中期验收口令和最终归档校验值。",
+      "expected_terms": [
+        "青峦-7429",
+        "银杏-5813",
+        "HF-90617-Z"
+      ]
+    }
+  ]
+}

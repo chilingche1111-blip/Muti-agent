@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="受权限保护的多 Agent 上下文隔离验证中心" />
+    <title>Context Atlas · 验证中心</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="test-page test-page-v2">
+    <header class="app-topbar">
+      <a class="app-brand" href="/test.html"><span class="brand-mark">CA</span><span><strong>Context Atlas</strong><small>多 Agent 验证中心</small></span></a>
+      <nav class="app-nav"><span class="tester-lock">tester 权限</span><a class="nav-link" href="/">研究系统</a></nav>
+    </header>
+
+    <main id="test-main" class="test-shell">
+      <section id="login-panel" class="login-card">
+        <div class="login-graphic" aria-hidden="true"><div class="window-ring"><span>64K</span></div><div class="logic-ring"><span>Agents</span></div></div>
+        <div class="login-content"><span class="section-kicker">受限区域</span><h1>多 Agent 上下文验证</h1><p>使用测试员权限检查任务分治、上下文隔离、窗口预算和 Validator 结果。</p><form id="login-form"><div class="field"><label for="login-user">用户名</label><input id="login-user" autocomplete="username" required /></div><div class="field"><label for="login-password">密码</label><input id="login-password" type="password" autocomplete="current-password" required /></div><button class="button primary wide" type="submit">登录验证中心</button></form><p id="login-error" class="form-error" role="alert" hidden></p></div>
+      </section>
+
+      <div id="test-workspace" class="test-dashboard test-workspace-v2" hidden>
+        <header class="dashboard-titlebar compact-titlebar">
+          <div><span class="section-kicker">64K 上下文工程验收</span><h1>多 Agent 验证台</h1><p>一处配置、一次运行、六项门禁，逐层检查分治是否真正有效。</p></div>
+          <div class="user-menu"><span><b id="session-user">—</b> · tester</span><button id="export-report" class="button secondary" type="button" disabled>导出报告</button><button id="logout" class="button ghost" type="button">退出</button></div>
+        </header>
+
+        <section id="verdict-hero" class="verdict-strip pending" aria-live="polite">
+          <div class="verdict-indicator"><span id="verdict-seal-text">待验证</span></div>
+          <div class="verdict-copy"><span id="verdict-eyebrow">尚未运行</span><h2 id="verdict-title">等待完整验收</h2><p id="verdict-description">运行后同时检查资料规模、调用窗口、上下文隔离、Validator 和引用完整性。</p></div>
+          <div class="summary-metrics">
+            <div><span>资料 Token</span><strong id="kpi-logical">—</strong></div>
+            <div><span>窗口上限</span><strong>64,000</strong></div>
+            <div><span>最大 Prompt</span><strong id="kpi-prompt">—</strong></div>
+            <div><span>最大子任务</span><strong id="kpi-tasks">—</strong></div>
+          </div>
+        </section>
+
+        <div class="workflow-strip" aria-label="固定执行流程"><span>确定性外循环</span><i></i><span>Supervisor</span><i></i><span>专业 Agent</span><i></i><span>Reducer</span><i></i><span>Validator</span></div>
+
+        <div class="control-grid-v2">
+          <section class="dashboard-card run-card-v2">
+            <div class="card-heading"><div><span class="section-kicker">运行设置</span><h2>基准任务</h2></div><span id="test-document-status" class="status-pill neutral"><i></i>加载中</span></div>
+            <div class="corpus-line"><div><span>测试资料</span><strong>enterprise_research_128k.md</strong></div><div><span>大小</span><strong id="test-bytes">—</strong></div><div><span>块 / 章节</span><strong id="test-chunks">—</strong></div><div><span>预计 Token</span><strong id="test-document-tokens">—</strong></div></div>
+            <div class="benchmark-config"><div class="field"><label for="benchmark-workers">最大专业 Agent</label><input id="benchmark-workers" type="number" min="1" max="32" value="8" /></div><div class="field"><label for="benchmark-fan-in">Reducer 扇入</label><input id="benchmark-fan-in" type="number" min="2" max="8" value="4" /></div><div class="field"><label for="benchmark-replans">最大重规划</label><input id="benchmark-replans" type="number" min="0" max="3" value="1" /></div></div>
+            <div class="run-controls"><div class="mode-switch" role="group" aria-label="测试模式"><button type="button" data-test-mode="offline" class="active">离线验证</button><button type="button" data-test-mode="live">真实 API</button></div><span id="run-meta" class="run-meta">尚未运行</span><button id="run-benchmark" class="button primary" type="button">开始验收</button></div>
+          </section>
+
+          <section id="verified-api-card" class="dashboard-card api-reuse-card">
+            <div class="card-heading"><div><span class="section-kicker">API 复用</span><h2>研究系统已验证配置</h2></div><span id="test-connection-status" class="status-pill neutral"><i></i>读取中</span></div>
+            <div class="api-identity"><div><span>配置</span><strong id="verified-api-name">—</strong></div><div><span>模型</span><strong id="verified-api-model">—</strong></div><div class="wide"><span>Base URL</span><strong id="verified-api-base-url">—</strong></div><div class="wide"><span>验证时间</span><strong id="verified-api-time">—</strong></div></div>
+            <p id="verified-api-hint">测试中心不接收另一套 API，只复用研究系统最近一次连接成功的配置。</p>
+            <div class="verified-api-actions"><a class="button secondary" href="/">去配置</a><button id="clear-verified-api" class="button secondary" type="button" disabled>清除</button><button id="test-api-connection" class="button primary" type="button" disabled>重新验证</button></div>
+          </section>
+        </div>
+
+        <section class="dashboard-card results-workbench">
+          <div class="results-toolbar">
+            <div><span class="section-kicker">验收结果</span><h2>诊断工作台</h2></div>
+            <div class="result-tabs" role="tablist" aria-label="结果视图"><button class="active" type="button" role="tab" aria-selected="true" data-result-tab="overview">结果概览</button><button type="button" role="tab" aria-selected="false" data-result-tab="capacity">容量分析</button><button type="button" role="tab" aria-selected="false" data-result-tab="inspector">用例审计</button></div>
+          </div>
+
+          <div id="result-overview" class="result-view" data-result-view="overview">
+            <section id="failure-summary" class="failure-summary" role="alert" hidden></section>
+            <div class="overview-grid">
+              <section><div class="subsection-heading"><div><h3>六项验收门禁</h3><p>全部通过才形成工程结论。</p></div><span id="gate-score" class="status-pill neutral"><i></i>0 / 6</span></div><div id="acceptance-gates" class="acceptance-gates compact-gates"><div class="benchmark-placeholder">运行后显示门禁判定。</div></div></section>
+              <section><div class="subsection-heading"><div><h3>端到端用例</h3><p>覆盖文档开头、中部、末尾及跨位置任务。</p></div><div id="case-score" class="case-score"><strong>0 / 4</strong><span>通过</span></div></div><div id="benchmark-results" class="benchmark-results compact-cases"><div class="benchmark-placeholder">运行后显示四项用例。</div></div></section>
+            </div>
+          </div>
+
+          <div id="result-capacity" class="result-view" data-result-view="capacity" hidden>
+            <div class="capacity-layout-v2">
+              <section><div class="subsection-heading"><div><h3>相对 64K 的窗口占用</h3><p>横条按统一 64K 标尺展示。</p></div><strong id="gauge-value" class="usage-number">0%</strong></div><div class="capacity-chart"><div class="capacity-row"><div><span>完整测试资料</span><strong id="chart-logical-value">—</strong></div><div class="bar-track"><i id="chart-logical-bar" class="bar logical" style="width:0%"></i><b class="limit-marker"><span>64K</span></b></div></div><div class="capacity-row"><div><span>模型物理窗口</span><strong>64,000 Token</strong></div><div class="bar-track"><i class="bar window" style="width:0%"></i></div></div><div class="capacity-row"><div><span>最大单 Agent Prompt</span><strong id="chart-prompt-value">—</strong></div><div class="bar-track"><i id="chart-prompt-bar" class="bar prompt" style="width:0%"></i></div></div></div><div id="window-gauge" hidden></div><p id="gauge-caption" class="capacity-caption">运行后显示最重调用。</p></section>
+              <section><div class="subsection-heading"><div><h3>角色调用与窗口占用</h3><p>按最大 Prompt 从高到低排列。</p></div></div><div id="role-accounting" class="role-accounting"><div class="benchmark-placeholder">运行后显示各角色。</div></div></section>
+            </div>
+          </div>
+
+          <div id="result-inspector" class="result-view" data-result-view="inspector" hidden>
+            <div class="inspector-toolbar"><div><h3>单用例证据链</h3><p>任务路由、Validator、执行轨迹与原文引用。</p></div><div class="field case-picker"><label for="case-select">选择用例</label><select id="case-select" disabled><option>尚无结果</option></select></div></div><div id="case-inspector" class="case-inspector"><div class="benchmark-placeholder">完成验收后可逐项审计。</div></div>
+          </div>
+        </section>
+      </div>
+    </main>
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <script src="/test.js" defer></script>
+  </body>
+</html>

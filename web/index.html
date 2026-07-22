@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="企业多 Agent 分治研究系统" />
+    <title>Context Atlas · 多 Agent 研究系统</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="agent-page">
+    <a class="skip-link" href="#agent-main">跳到主要内容</a>
+    <header class="app-topbar">
+      <a class="app-brand" href="/" aria-label="Context Atlas 首页">
+        <span class="brand-mark" aria-hidden="true">CA</span>
+        <span><strong>Context Atlas</strong><small>多 Agent 分治研究系统</small></span>
+      </a>
+      <nav class="app-nav" aria-label="主要导航">
+        <span class="security-note">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-2.9 8.3-7 10-4.1-1.7-7-5.5-7-10V6l7-3zm0 4.2L8 8.9V11c0 2.9 1.6 5.5 4 6.8 2.4-1.3 4-3.9 4-6.8V8.9l-4-1.7z"/></svg>
+          密钥仅保留在当前会话
+        </span>
+        <a class="nav-link" href="/test.html">验证中心</a>
+      </nav>
+    </header>
+
+    <main id="agent-main" class="agent-shell">
+      <aside class="agent-sidebar" aria-label="资料与配置">
+        <section class="sidebar-section document-section">
+          <div class="section-kicker">知识源</div>
+          <div class="section-heading-row">
+            <h1>业务文档</h1>
+            <span id="document-status" class="status-pill neutral"><i></i>未加载</span>
+          </div>
+          <p class="sidebar-copy">上传资料后，主 Agent 会统一调度上下文相互隔离的专业子 Agent。</p>
+
+          <label id="drop-zone" class="document-drop" for="document-file">
+            <input id="document-file" type="file" accept=".txt,.md,.csv,.json,.log,.doc,.docx,.pdf,.ppt,.pptx,.rtf,.odt,.odp,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation" />
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V5m0 0L8 9m4-4l4 4M5 15v3a1 1 0 001 1h12a1 1 0 001-1v-3"/></svg>
+            <strong>选择或拖入文档</strong>
+            <span>Word、PDF、PPT、TXT、Markdown 等 · 最大 20 MB</span>
+          </label>
+
+          <div class="document-facts" aria-label="文档统计">
+            <div><span>估算 Token</span><strong id="metric-tokens">—</strong></div>
+            <div><span>检索块 / 章节</span><strong id="metric-chunks">—</strong></div>
+            <div><span>大小</span><strong id="metric-bytes">—</strong></div>
+          </div>
+          <div id="limit-verdict" class="limit-verdict neutral"><span aria-hidden="true"></span>等待加载文档</div>
+        </section>
+
+        <details id="api-settings" class="sidebar-details">
+          <summary>
+            <span class="summary-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM19.4 15a7.8 7.8 0 00.1-1 7.8 7.8 0 00-.1-1l2-1.6-2-3.4-2.5 1a7.5 7.5 0 00-1.7-1L14.8 5h-4l-.4 3a7.5 7.5 0 00-1.7 1L6.2 8l-2 3.4 2 1.6a7.8 7.8 0 00-.1 1 7.8 7.8 0 00.1 1l-2 1.6 2 3.4 2.5-1a7.5 7.5 0 001.7 1l.4 3h4l.4-3a7.5 7.5 0 001.7-1l2.5 1 2-3.4-2-1.6z"/></svg></span>
+            <span><strong>模型连接</strong><small>智能回答模式时使用</small></span>
+            <span id="connection-status" class="status-pill neutral"><i></i>未测试</span>
+          </summary>
+          <div class="details-content">
+            <div class="field"><label for="profile-select">配置档案</label><div class="inline-controls"><select id="profile-select"><option value="">临时配置</option></select><button id="delete-profile" class="icon-button" type="button" aria-label="删除当前API配置档案"><svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6m4-6v6M9 7l1-2h4l1 2m3 0l-1 14H7L6 7"/></svg></button></div></div>
+            <div class="field"><label for="base-url">Base URL</label><input id="base-url" type="url" autocomplete="off" placeholder="https://example.com/v1" /></div>
+            <div class="field"><label for="api-key">API Key</label><div class="secret-field"><input id="api-key" type="password" autocomplete="off" placeholder="仅用于当前请求" /><button id="toggle-secret" type="button" aria-label="显示或隐藏API密钥">显示</button></div></div>
+            <div class="two-fields"><div class="field"><label for="model-name">模型</label><input id="model-name" autocomplete="off" placeholder="qwen" /></div><div class="field"><label for="timeout">超时（秒）</label><input id="timeout" type="number" min="5" max="600" value="90" /></div></div>
+            <div class="field"><label for="profile-name">档案名称</label><input id="profile-name" autocomplete="off" placeholder="例如：公司 Qwen" /></div>
+            <div class="details-actions"><button id="test-connection" class="button secondary" type="button">测试连接</button><button id="save-profile" class="button primary" type="button">保存会话配置</button></div>
+          </div>
+        </details>
+
+        <div class="sidebar-footnote">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a10 10 0 100-20 10 10 0 000 20zm0-11v6m0-10h.01"/></svg>
+          <span>模型窗口仍为 64K；确定性外循环通过统一调度、专业 Agent 隔离、分层归并和 Validator 控制上下文。</span>
+        </div>
+      </aside>
+
+      <section class="chat-workspace" aria-label="研究对话">
+        <header class="workspace-header">
+          <div><span class="section-kicker">Supervisor workspace</span><h2>由主 Agent 管理分治任务</h2></div>
+          <div class="workspace-runtime" aria-label="当前运行模式">
+            <span><i aria-hidden="true"></i><strong>智能工作台</strong><small>企业 LLM · 多 Agent</small></span>
+            <a href="/test.html">流程演示与验收 →</a>
+          </div>
+        </header>
+
+        <div id="result-panel" class="conversation" role="region" aria-label="研究结果，可滚动" aria-live="polite" tabindex="0">
+          <div class="result-empty">
+            <div class="empty-visual" aria-hidden="true"><span></span><span></span><span></span></div>
+            <strong id="empty-title">开始一次智能问答</strong>
+            <p id="empty-copy">可直接使用通用 LLM，也可以上传文档后启用多 Agent 分治与联网检索。</p>
+            <div class="method-steps" aria-label="处理方法">
+              <span><b>01</b> 通用回答</span><i></i><span><b>02</b> 文档分治</span><i></i><span><b>03</b> 联网检索</span>
+            </div>
+          </div>
+
+          <div class="result-content" hidden>
+            <div class="message question-message"><span class="message-label">你的问题</span><p id="result-question"></p></div>
+            <div class="message answer-message">
+              <div class="message-head"><span id="answer-mode-label" class="message-label">多 Agent 综合回答</span><div><span id="result-status" class="status-pill success"><i></i>已完成</span><button id="copy-answer" class="icon-text-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8h11v11H8zM5 16H4V5h11v1"/></svg>复制</button></div></div>
+              <div id="answer-content" class="answer-content"></div>
+              <div id="document-read-nav" class="document-read-nav" hidden><button id="read-previous" class="button secondary" type="button">上一段</button><span id="read-progress">—</span><button id="read-next" class="button secondary" type="button">下一段</button></div>
+            </div>
+
+            <section id="context-proof-card" class="context-proof-card" aria-labelledby="context-proof-title">
+              <div class="proof-card-head"><div><span class="section-kicker">Context isolation</span><h3 id="context-proof-title">多 Agent 上下文隔离证明</h3></div><span id="context-proof-state" class="proof-neutral">等待统计</span></div>
+              <div class="context-flow" aria-label="完整资料与模型窗口比较">
+                <div><span>完整资料</span><strong id="result-document-tokens">—</strong></div><svg viewBox="0 0 48 24" aria-hidden="true"><path d="M2 12h42m-7-7l7 7-7 7"/></svg><div><span>最大单次 Prompt</span><strong id="result-prompt-tokens">—</strong></div><svg viewBox="0 0 48 24" aria-hidden="true"><path d="M2 12h42m-7-7l7 7-7 7"/></svg><div><span>64K 模型窗口</span><strong id="result-window-usage">—</strong></div>
+              </div>
+              <div class="proof-meta"><span>子任务 <strong id="result-task-count">—</strong></span><span>专业 Agent 隔离 <strong id="result-isolation">—</strong></span><span>主 Agent 接收原文 <strong id="result-supervisor-raw">—</strong></span><span>模型调用 <strong id="result-call-count">—</strong></span></div>
+            </section>
+
+            <div class="result-grid">
+              <section><div class="result-subheading"><h3>原文引用</h3><span id="citation-count">0 条</span></div><div id="citations" class="citations"></div></section>
+              <details class="trace-details"><summary>查看多 Agent 图执行轨迹</summary><div id="trace" class="trace"></div></details>
+            </div>
+          </div>
+        </div>
+
+        <footer class="composer">
+          <div class="assistant-toolbar">
+            <div class="scope-control">
+              <span class="control-label">回答范围</span>
+              <div class="scope-switch" role="group" aria-label="回答范围">
+                <button type="button" data-scope="auto" class="active" aria-pressed="true">自动</button>
+                <button type="button" data-scope="general" aria-pressed="false">通用</button>
+                <button type="button" data-scope="document" aria-pressed="false">文档</button>
+              </div>
+            </div>
+            <label class="web-toggle" title="搜索公开网页并把来源交给模型">
+              <input id="web-search-toggle" type="checkbox" />
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.7 2.5 4.2 5.5 4.2 9S14.7 18.5 12 21c-2.7-2.5-4.2-5.5-4.2-9S9.3 5.5 12 3z"/></svg>
+              <span><strong>联网检索</strong><small id="web-search-state">关闭</small></span>
+              <i aria-hidden="true"></i>
+            </label>
+          </div>
+          <div class="suggestions" aria-label="快捷问题">
+            <span>快捷问题</span>
+            <button type="button" data-question="概括这份资料的主要结论，并给出原文依据。">总结要点</button>
+            <button type="button" data-question="请找出资料中相互矛盾或需要进一步核实的信息。">识别矛盾</button>
+            <button type="button" data-question="请从资料中提取关键事实，并按主题组织。">提取事实</button>
+            <button type="button" data-question="请输出 PDF 全部内容。">读取原文</button>
+          </div>
+          <div class="composer-box">
+            <label class="sr-only" for="question">输入问题</label>
+            <textarea id="question" rows="3" placeholder="直接提问，或上传文档后针对资料提问…"></textarea>
+            <button id="run-research" class="send-button" type="button" aria-label="开始调研"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6l6 6-6 6"/></svg></button>
+          </div>
+          <div class="composer-footer">
+            <p id="mode-hint">智能回答 · 自动判断通用问答或文档 Agent。</p>
+            <details class="advanced-settings"><summary>运行参数</summary><div class="advanced-popover"><div class="field"><label for="max-workers">最大 Worker 数</label><input id="max-workers" type="number" min="1" max="32" value="8" /></div><div class="field"><label for="reduce-fan-in">Reducer 扇入</label><input id="reduce-fan-in" type="number" min="2" max="8" value="4" /></div></div></details>
+          </div>
+        </footer>
+      </section>
+    </main>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
