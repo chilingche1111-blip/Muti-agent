@@ -4,8 +4,6 @@
 > 底层模型：公司本地部署的 OpenAI Chat Completions 兼容模型
 > 核心架构：LangGraph 确定性外循环 + 主 Agent 调度 + 专业 Agent 隔离执行 + 树形归并 + Validator
 > 当前状态：30 项自动测试通过；177,420 Token 长文档离线基准 4/4 通过
-> 本地地址：`http://127.0.0.1:8080/`
-> 验证中心：`http://127.0.0.1:8080/test.html`
 
 首次使用请阅读：[《Context Atlas 使用说明书》](USER_GUIDE.md)
 
@@ -847,13 +845,7 @@ python3 -m pip install -e .
 ### 12.2 启动服务
 
 ```bash
-python3 -m long_context_agent.web_server --host 127.0.0.1 --port 8080
-```
-
-打开：
-
-```text
-http://127.0.0.1:8080/
+python3 -m long_context_agent.web_server --port 8080
 ```
 
 ### 12.3 API 配置
