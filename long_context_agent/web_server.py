@@ -24,7 +24,7 @@ from .benchmark import DeterministicTestModel, run_benchmark
 from .document import DocumentIndex
 from .file_parser import MAX_FILE_BYTES, ParsedDocument, parse_uploaded_document
 from .llm import LLMError, LLMSettings, OpenAICompatibleClient
-from .orchestrator import MultiAgentResearchSystem
+from .orchestrator import DEFAULT_AGENT_COUNT, SOURCE_SHARD_BYTE_LIMIT, MultiAgentResearchSystem
 from .tokens import estimate_messages_tokens, estimate_tokens
 from .web_search import WebSearchResult, search_web
 
@@ -185,10 +185,12 @@ class ResearchApplication:
 
     def _load_parsed(self, parsed: ParsedDocument, *, source_bytes: int) -> dict[str, Any]:
         new_index = DocumentIndex()
-        chunks = new_index.add_text(parsed.name, parsed.text)
+        chunks = new_index.add_text(parsed.name, parsed.text, source_bytes=source_bytes)
+        indexed_bytes = len(parsed.text.encode("utf-8"))
         document = {
             "name": parsed.name,
             "bytes": source_bytes,
+            "indexed_bytes": indexed_bytes,
             "extracted_characters": len(parsed.text),
             "estimated_tokens": estimate_tokens(parsed.text),
             "chunks": len(chunks),
@@ -198,6 +200,8 @@ class ResearchApplication:
             "parser_metadata": parsed.metadata,
             "exceeds_64kb_bytes": source_bytes > 65_536,
             "exceeds_64k_tokens": estimate_tokens(parsed.text) > 65_536,
+            "exceeds_shard_byte_limit": indexed_bytes > SOURCE_SHARD_BYTE_LIMIT,
+            "shard_byte_limit": SOURCE_SHARD_BYTE_LIMIT,
         }
         with self.lock:
             self.index = new_index
@@ -276,6 +280,11 @@ class ResearchApplication:
             "document": result["document_read"]["document_name"],
             "section": label,
             "excerpt": content[:500],
+            "document_bytes": int((self.document or {}).get("bytes", 0)),
+            "indexed_bytes": int((self.document or {}).get("indexed_bytes", len(self.document_text.encode("utf-8")))),
+            "chunk_bytes": len(content.encode("utf-8")),
+            "source_exceeds_shard_limit": bool((self.document or {}).get("exceeds_shard_byte_limit", False)),
+            "shard_byte_limit": int((self.document or {}).get("shard_byte_limit", SOURCE_SHARD_BYTE_LIMIT)),
         }]
         result["trace"][0]["detail"] = f"按页标记精确返回{label}，未调用 LLM 或语义检索"
         result["stop_reason"] = "direct_page_read"
@@ -350,6 +359,11 @@ class ResearchApplication:
                     "excerpt": item.snippet,
                     "url": item.url,
                     "source_type": "web",
+                    "document_bytes": len((item.snippet or "").encode("utf-8")),
+                    "indexed_bytes": len((item.snippet or "").encode("utf-8")),
+                    "chunk_bytes": len((item.snippet or "").encode("utf-8")),
+                    "source_exceeds_shard_limit": False,
+                    "shard_byte_limit": SOURCE_SHARD_BYTE_LIMIT,
                 }
                 for index, item in enumerate(web_results, start=1)
             ],
@@ -423,6 +437,15 @@ class ResearchApplication:
                 "model_calls": 1,
                 "divide_and_conquer_verified": False,
                 "architecture": "Direct LLM chat with bounded conversation memory",
+                "default_agents": 1,
+                "desired_agents": 1,
+                "allocated_agents": 1,
+                "max_agents": 1,
+                "source_indexed_bytes": 0,
+                "largest_source_indexed_bytes": 0,
+                "shard_byte_limit": SOURCE_SHARD_BYTE_LIMIT,
+                "source_exceeds_shard_limit": False,
+                "multi_agent_sharding_active": False,
             },
         }
 
@@ -475,6 +498,15 @@ class ResearchApplication:
             "divide_and_conquer_verified": False,
             "execution_mode": "direct_document_read",
             "architecture": "Deterministic document reader outside the LLM context window",
+            "default_agents": 0,
+            "desired_agents": 0,
+            "allocated_agents": 0,
+            "max_agents": 0,
+            "source_indexed_bytes": int(document.get("indexed_bytes", len(text.encode("utf-8")))),
+            "largest_source_indexed_bytes": int(document.get("indexed_bytes", len(text.encode("utf-8")))),
+            "shard_byte_limit": int(document.get("shard_byte_limit", SOURCE_SHARD_BYTE_LIMIT)),
+            "source_exceeds_shard_limit": bool(document.get("exceeds_shard_byte_limit", False)),
+            "multi_agent_sharding_active": False,
         }
         return {
             "answer": content,
@@ -484,6 +516,11 @@ class ResearchApplication:
                 "document": document.get("name"),
                 "section": f"原文字符 {start + 1}–{end}",
                 "excerpt": content[:500],
+                "document_bytes": int(document.get("bytes", 0)),
+                "indexed_bytes": int(document.get("indexed_bytes", len(text.encode("utf-8")))),
+                "chunk_bytes": len(content.encode("utf-8")),
+                "source_exceeds_shard_limit": bool(document.get("exceeds_shard_byte_limit", False)),
+                "shard_byte_limit": int(document.get("shard_byte_limit", SOURCE_SHARD_BYTE_LIMIT)),
             }],
             "tasks": [{
                 "task_id": "direct_read_01",
@@ -597,28 +634,39 @@ class ResearchApplication:
             page_index.add_text(
                 f"{document.get('name', 'document')} 第{requested_pages[0]}-{requested_pages[1]}页",
                 page_text,
+                source_bytes=len(page_text.encode("utf-8")),
             )
             for position, item in enumerate(web_results, start=1):
+                web_text = f"# 联网来源 {position}\n\n标题：{item.title}\nURL：{item.url}\n摘要：{item.snippet}"
                 page_index.add_text(
                     f"联网来源 {position}：{item.title}｜{item.url}",
-                    f"# 联网来源 {position}\n\n标题：{item.title}\nURL：{item.url}\n摘要：{item.snippet}",
+                    web_text,
+                    source_bytes=len(web_text.encode("utf-8")),
                 )
             index = page_index
         elif web_results:
             combined_index = DocumentIndex()
-            combined_index.add_text(str(document.get("name") or "document"), document_text)
+            combined_index.add_text(
+                str(document.get("name") or "document"),
+                document_text,
+                source_bytes=int(document.get("bytes", len(document_text.encode("utf-8")))),
+            )
             for position, item in enumerate(web_results, start=1):
+                web_text = f"# 联网来源 {position}\n\n标题：{item.title}\nURL：{item.url}\n摘要：{item.snippet}"
                 combined_index.add_text(
                     f"联网来源 {position}：{item.title}｜{item.url}",
-                    f"# 联网来源 {position}\n\n标题：{item.title}\nURL：{item.url}\n摘要：{item.snippet}",
+                    web_text,
+                    source_bytes=len(web_text.encode("utf-8")),
                 )
             index = combined_index
         max_workers = int(payload.get("max_workers", 8))
+        default_agents = int(payload.get("default_agents", DEFAULT_AGENT_COUNT))
         reduce_fan_in = int(payload.get("reduce_fan_in", 4))
         system = MultiAgentResearchSystem(
             model,
             index,
             max_workers=max_workers,
+            default_agents=default_agents,
             reduce_fan_in=reduce_fan_in,
         )
         result = asdict(system.answer(question))
@@ -633,6 +681,11 @@ class ResearchApplication:
                 "excerpt": item.snippet,
                 "url": item.url,
                 "source_type": "web",
+                "document_bytes": len((item.snippet or "").encode("utf-8")),
+                "indexed_bytes": len((item.snippet or "").encode("utf-8")),
+                "chunk_bytes": len((item.snippet or "").encode("utf-8")),
+                "source_exceeds_shard_limit": False,
+                "shard_byte_limit": SOURCE_SHARD_BYTE_LIMIT,
             } for position, item in enumerate(web_results, start=1))
         if requested_pages:
             result["page_scope"] = {
@@ -641,6 +694,7 @@ class ResearchApplication:
                 "retrieval_restricted_to_requested_pages": True,
             }
         metrics = result["context_metrics"]
+        allocation = metrics.get("agent_allocation", {})
         document_tokens = int(document.get("estimated_tokens", 0))
         result["capacity_report"] = {
             "document_tokens_estimate": document_tokens,
@@ -656,7 +710,11 @@ class ResearchApplication:
             "control_plane": metrics["control_plane"],
             "model_calls": metrics["model_calls"],
             "divide_and_conquer_verified": (
-                document_tokens > 65_536
+                (
+                    document_tokens > 65_536
+                    or bool(allocation.get("source_exceeds_shard_limit", False))
+                )
+                and int(allocation.get("allocated_agents", 0)) > 1
                 and metrics["all_agent_calls_within_limit"]
                 and result["validation"].get("approved", False)
             ),
@@ -665,6 +723,18 @@ class ResearchApplication:
             "intent": metrics.get("intent"),
             "structured_output_retries": metrics.get("structured_output_retries", 0),
             "retrieval_strategies": metrics.get("retrieval_strategies", []),
+            "default_agents": allocation.get("default_agents", default_agents),
+            "desired_agents": allocation.get("desired_agents", metrics["task_count"]),
+            "allocated_agents": allocation.get("allocated_agents", metrics["task_count"]),
+            "max_agents": allocation.get("max_agents", max_workers),
+            "agent_allocation_reason": allocation.get("allocation_reason", ""),
+            "source_indexed_bytes": allocation.get("source_indexed_bytes", 0),
+            "largest_source_indexed_bytes": allocation.get("largest_source_indexed_bytes", 0),
+            "shard_byte_limit": allocation.get("shard_byte_limit", SOURCE_SHARD_BYTE_LIMIT),
+            "target_shard_bytes": allocation.get("target_shard_bytes", SOURCE_SHARD_BYTE_LIMIT),
+            "source_exceeds_shard_limit": allocation.get("source_exceeds_shard_limit", False),
+            "multi_agent_sharding_active": allocation.get("multi_agent_sharding_active", False),
+            "exhaustive_scan": allocation.get("exhaustive_scan", False),
         }
         return result
 

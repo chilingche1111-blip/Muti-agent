@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import operator
 import re
 import threading
@@ -20,6 +21,10 @@ from .tokens import estimate_messages_tokens, estimate_tokens
 MODEL_CONTEXT_LIMIT = 64_000
 OUTPUT_RESERVE = 2_000
 SAFETY_MARGIN = 1_000
+DEFAULT_AGENT_COUNT = 3
+SOURCE_SHARD_BYTE_LIMIT = 64 * 1024
+TARGET_CHUNKS_PER_AGENT = 128
+EXHAUSTIVE_SCAN_TERMS = ("全部", "所有", "完整清单", "逐条", "逐项", "员工信息", "员工名单")
 
 SPECIALIST_NODE_MAP = {
     "fact_extractor": "fact_agent",
@@ -59,6 +64,7 @@ class GraphState(TypedDict, total=False):
     stop_reason: str
     planning_source: str
     intent: str
+    agent_allocation: dict[str, Any]
 
 
 class SpecialistState(TypedDict):
@@ -104,6 +110,8 @@ class MultiAgentResearchSystem:
         artifact_store: ArtifactStore | None = None,
         context_limit: int = MODEL_CONTEXT_LIMIT,
         max_workers: int = 8,
+        default_agents: int = DEFAULT_AGENT_COUNT,
+        shard_byte_limit: int = SOURCE_SHARD_BYTE_LIMIT,
         reduce_fan_in: int = 4,
         max_replans: int = 1,
     ) -> None:
@@ -111,6 +119,10 @@ class MultiAgentResearchSystem:
             raise ValueError("模型上下文上限不能低于 8,000 Token")
         if max_workers < 1 or max_workers > 32:
             raise ValueError("专业子 Agent 数量必须在 1至32 之间")
+        if default_agents < 1 or default_agents > 32:
+            raise ValueError("默认专业 Agent 数量必须在 1至32 之间")
+        if shard_byte_limit < 16 * 1024 or shard_byte_limit > 4 * 1024 * 1024:
+            raise ValueError("单 Agent 分片阈值必须在 16 KB至4 MB 之间")
         if reduce_fan_in < 2 or reduce_fan_in > 8:
             raise ValueError("Reducer 扇入必须在 2至8 之间")
         if max_replans < 0 or max_replans > 3:
@@ -120,6 +132,8 @@ class MultiAgentResearchSystem:
         self.artifacts = artifact_store or ArtifactStore()
         self.context_limit = context_limit
         self.max_workers = max_workers
+        self.default_agents = min(default_agents, max_workers)
+        self.shard_byte_limit = shard_byte_limit
         self.reduce_fan_in = reduce_fan_in
         self.max_replans = max_replans
         self._model_lock = threading.RLock()
@@ -129,6 +143,7 @@ class MultiAgentResearchSystem:
         self._planning_source = "unknown"
         self._intent = "unknown"
         self._retrieval_strategies: set[str] = set()
+        self._allocation: dict[str, Any] = {}
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -171,6 +186,7 @@ class MultiAgentResearchSystem:
         self._planning_source = "unknown"
         self._intent = "unknown"
         self._retrieval_strategies = set()
+        self._allocation = {}
         self.artifacts.clear()
         state = self._graph.invoke(
             {"question": question.strip(), "findings": [], "trace": [], "iteration": 0},
@@ -225,6 +241,7 @@ class MultiAgentResearchSystem:
         else:
             tasks = self._normalize_tasks(controlled_tasks, question)
             planning_source = "deterministic_router"
+        tasks = self._allocate_agent_tasks(tasks, question)
         self._planning_source = planning_source
         self._intent = intent
         role_counts: dict[str, int] = {}
@@ -236,13 +253,15 @@ class MultiAgentResearchSystem:
             "iteration": 0,
             "planning_source": planning_source,
             "intent": intent,
+            "agent_allocation": dict(self._allocation),
             "trace": [{
                 "node": "supervisor",
                 "role": "主 Agent",
                 "status": "scheduled",
                 "detail": (
                     f"识别意图={intent}；规划来源={planning_source}；"
-                    f"生成并校验 {len(tasks)} 个任务；专业分配 {role_counts}"
+                    f"生成并校验 {len(tasks)} 个分片任务；自动分配 {self._allocation.get('allocated_agents', len(tasks))} 个 Agent；"
+                    f"专业分配 {role_counts}"
                 ),
                 "task_ids": [task["task_id"] for task in tasks],
             }],
@@ -343,6 +362,91 @@ class MultiAgentResearchSystem:
             )]
         return [task.as_dict() for task in sorted(tasks, key=lambda item: -item.priority)]
 
+    def _allocate_agent_tasks(
+        self,
+        base_tasks: list[dict[str, Any]],
+        question: str,
+    ) -> list[dict[str, Any]]:
+        """Scale worker count from source size and task complexity, then assign bounded shards."""
+        chunks = self.index.all_chunks()
+        indexed_bytes = self.index.total_indexed_bytes
+        compact = re.sub(r"\s+", "", question)
+        exhaustive_scan = any(term in compact for term in EXHAUSTIVE_SCAN_TERMS)
+        target_shard_bytes = self.shard_byte_limit // 2 if exhaustive_scan else self.shard_byte_limit
+        byte_required = max(1, math.ceil(indexed_bytes / target_shard_bytes))
+        chunk_required = max(1, math.ceil(len(chunks) / TARGET_CHUNKS_PER_AGENT))
+        complexity_markers = sum(
+            compact.count(marker)
+            for marker in ("同时", "分别", "逐项", "以及", "并且", "、", "；", "比较", "风险")
+        )
+        complexity_required = min(self.max_workers, 1 + complexity_markers + len(compact) // 500)
+        desired = max(
+            self.default_agents,
+            len(base_tasks),
+            byte_required,
+            chunk_required,
+            complexity_required,
+        )
+        allocated = min(self.max_workers, desired)
+
+        reasons: list[str] = [f"默认至少 {self.default_agents} 个"]
+        if byte_required > self.default_agents:
+            reasons.append(
+                f"索引文本 {indexed_bytes} Bytes 按 {target_shard_bytes} Bytes 目标分片需要 {byte_required} 个"
+            )
+        if chunk_required > self.default_agents:
+            reasons.append(f"{len(chunks)} 个检索块需要 {chunk_required} 个")
+        if complexity_required > self.default_agents:
+            reasons.append(f"任务复杂度需要 {complexity_required} 个")
+        if desired > self.max_workers:
+            reasons.append(f"受最大 Worker 数 {self.max_workers} 限制")
+
+        allocated_tasks: list[dict[str, Any]] = []
+        chunk_count = len(chunks)
+        for slot in range(allocated):
+            template = dict(base_tasks[slot % len(base_tasks)])
+            if chunk_count == 0:
+                chunk_start = chunk_end = 0
+            elif allocated <= chunk_count:
+                chunk_start = slot * chunk_count // allocated
+                chunk_end = (slot + 1) * chunk_count // allocated
+            else:
+                chunk_start = slot % chunk_count
+                chunk_end = chunk_start + 1
+            shard_chunks = chunks[chunk_start:chunk_end]
+            combined_query = str(template.get("query", "")).strip()
+            if question.casefold() not in combined_query.casefold():
+                combined_query = f"{combined_query}\n总体目标：{question}".strip()
+            template.update({
+                "task_id": f"task_{slot + 1:02d}",
+                "base_task_id": template.get("task_id", ""),
+                "query": combined_query[:1_000],
+                "agent_instance_id": f"{template.get('agent_type', 'worker')}_{slot + 1:02d}",
+                "shard_index": slot + 1,
+                "shard_count": allocated,
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+                "shard_chunks": len(shard_chunks),
+                "shard_bytes": sum(chunk.byte_size for chunk in shard_chunks),
+            })
+            allocated_tasks.append(template)
+
+        self._allocation = {
+            "default_agents": self.default_agents,
+            "desired_agents": desired,
+            "allocated_agents": allocated,
+            "max_agents": self.max_workers,
+            "source_indexed_bytes": indexed_bytes,
+            "largest_source_indexed_bytes": self.index.largest_source_indexed_bytes,
+            "shard_byte_limit": self.shard_byte_limit,
+            "target_shard_bytes": target_shard_bytes,
+            "source_exceeds_shard_limit": self.index.largest_source_indexed_bytes > self.shard_byte_limit,
+            "multi_agent_sharding_active": allocated > 1,
+            "exhaustive_scan": exhaustive_scan,
+            "allocation_reason": "；".join(reasons),
+        }
+        return allocated_tasks
+
     @staticmethod
     def _infer_agent_type(text: str) -> str:
         compact = text.casefold()
@@ -380,8 +484,12 @@ class MultiAgentResearchSystem:
         hits, retrieval_strategy = self._retrieve_hits(task, agent_type)
         with self._record_lock:
             self._retrieval_strategies.add(retrieval_strategy)
-        evidence_budget = min(8_000, int(task.get("input_budget", 12_000)) - 2_000)
-        evidence_ids, packed = self._pack_evidence(hits, budget=max(1_000, evidence_budget))
+        evidence_budget = min(10_000, int(task.get("input_budget", 12_000)) - 2_000)
+        evidence_ids, packed = self._pack_evidence(
+            hits,
+            budget=max(1_000, evidence_budget),
+            task=task,
+        )
         messages = [
             {
                 "role": "system",
@@ -425,6 +533,10 @@ class MultiAgentResearchSystem:
             "evidence_ids": valid_ids,
             "confidence": self._confidence(parsed.get("confidence")),
             "retrieval_strategy": retrieval_strategy,
+            "agent_instance_id": task.get("agent_instance_id"),
+            "shard_index": task.get("shard_index"),
+            "shard_count": task.get("shard_count"),
+            "shard_bytes": task.get("shard_bytes"),
         }
         finding["artifact_id"] = self.artifacts.put(
             "finding", json.dumps(finding, ensure_ascii=False),
@@ -438,7 +550,8 @@ class MultiAgentResearchSystem:
                 "task_id": task["task_id"],
                 "status": "completed",
                 "detail": (
-                    f"独立执行完成；检索策略={retrieval_strategy}；"
+                    f"独立执行完成；分片={task.get('shard_index', 1)}/{task.get('shard_count', 1)}；"
+                    f"分片大小={task.get('shard_bytes', 0)} Bytes；检索策略={retrieval_strategy}；"
                     f"引用 {len(valid_ids)} 个证据对象"
                 ),
                 "artifact_id": finding["artifact_id"],
@@ -452,14 +565,36 @@ class MultiAgentResearchSystem:
     ) -> tuple[list[SearchHit], str]:
         """Combine exact retrieval with positional coverage for broad document questions."""
         query = str(task.get("query", ""))
-        lexical_hits = self.index.search(query, limit=7)
+        chunk_start = max(0, int(task.get("chunk_start", 0)))
+        chunk_end = min(
+            len(self.index.chunks),
+            int(task.get("chunk_end", len(self.index.chunks))),
+        )
+        shard_chunks = self.index.all_chunks()[chunk_start:chunk_end]
         compact = re.sub(r"\s+", "", f"{task.get('objective', '')}{query}".casefold())
+        if any(term in compact for term in EXHAUSTIVE_SCAN_TERMS):
+            return [
+                SearchHit(chunk=chunk, score=1.0, source="shard_exhaustive_scan")
+                for chunk in shard_chunks
+            ], "sharded_exhaustive_scan"
+        lexical_hits = self.index.search(
+            query,
+            limit=7,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+        )
         broad_terms = ("总结", "概括", "全文", "主要内容", "核心内容", "要点", "文档开头", "文档末尾")
         needs_coverage = agent_type == "analyst" or any(term in compact for term in broad_terms)
         if not needs_coverage:
-            return lexical_hits, "hybrid_exact"
+            if lexical_hits:
+                return lexical_hits, "sharded_hybrid_exact"
+            fallback = [
+                SearchHit(chunk=chunk, score=0.01, source="shard_fallback")
+                for chunk in shard_chunks[:3]
+            ]
+            return fallback, "sharded_positional_fallback"
 
-        chunks = self.index.all_chunks()
+        chunks = shard_chunks
         coverage_hits: list[SearchHit] = []
         if chunks:
             sample_count = min(5, len(chunks))
@@ -489,9 +624,17 @@ class MultiAgentResearchSystem:
                 continue
             seen.add(hit.chunk.chunk_id)
             combined.append(hit)
-        return combined[:10], "hybrid_plus_positional_coverage"
+        if not combined and chunks:
+            combined = [SearchHit(chunk=chunks[0], score=0.01, source="shard_fallback")]
+        return combined[:10], "sharded_hybrid_plus_positional_coverage"
 
-    def _pack_evidence(self, hits: list[SearchHit], *, budget: int) -> tuple[list[str], str]:
+    def _pack_evidence(
+        self,
+        hits: list[SearchHit],
+        *,
+        budget: int,
+        task: dict[str, Any],
+    ) -> tuple[list[str], str]:
         artifact_ids: list[str] = []
         blocks: list[str] = []
         used = 0
@@ -500,12 +643,25 @@ class MultiAgentResearchSystem:
             cost = estimate_tokens(text) + 80
             if blocks and used + cost > budget:
                 break
+            source = self.index.source_for(hit.chunk.document_name)
+            indexed_bytes = int(source.get("indexed_bytes", 0))
             artifact_id = self.artifacts.put("evidence", text, {
                 "chunk_id": hit.chunk.chunk_id,
                 "document": hit.chunk.document_name,
                 "section": hit.chunk.section_title,
                 "score": round(hit.score, 6),
                 "retrieval_source": hit.source,
+                "document_bytes": int(source.get("source_bytes", 0)),
+                "indexed_bytes": indexed_bytes,
+                "chunk_bytes": hit.chunk.byte_size,
+                "source_exceeds_shard_limit": indexed_bytes > self.shard_byte_limit,
+                "shard_byte_limit": self.shard_byte_limit,
+                "task_id": task.get("task_id"),
+                "agent_type": task.get("agent_type"),
+                "agent_instance_id": task.get("agent_instance_id"),
+                "shard_index": task.get("shard_index", 1),
+                "shard_count": task.get("shard_count", 1),
+                "shard_bytes": task.get("shard_bytes", 0),
             })
             artifact_ids.append(artifact_id)
             blocks.append(f"[artifact_id={artifact_id}]\n{text}")
@@ -819,6 +975,7 @@ class MultiAgentResearchSystem:
             "intent": self._intent,
             "structured_output_retries": self._json_retries,
             "retrieval_strategies": sorted(self._retrieval_strategies),
+            "agent_allocation": dict(self._allocation),
             "by_role": by_role,
             "calls": self._calls,
         }
@@ -833,6 +990,17 @@ class MultiAgentResearchSystem:
             "document": artifact.metadata.get("document"),
             "section": artifact.metadata.get("section"),
             "excerpt": artifact.content[:500],
+            "document_bytes": artifact.metadata.get("document_bytes", 0),
+            "indexed_bytes": artifact.metadata.get("indexed_bytes", 0),
+            "chunk_bytes": artifact.metadata.get("chunk_bytes", len(artifact.content.encode("utf-8"))),
+            "source_exceeds_shard_limit": artifact.metadata.get("source_exceeds_shard_limit", False),
+            "shard_byte_limit": artifact.metadata.get("shard_byte_limit", self.shard_byte_limit),
+            "task_id": artifact.metadata.get("task_id"),
+            "agent_type": artifact.metadata.get("agent_type"),
+            "agent_instance_id": artifact.metadata.get("agent_instance_id"),
+            "shard_index": artifact.metadata.get("shard_index", 1),
+            "shard_count": artifact.metadata.get("shard_count", 1),
+            "shard_bytes": artifact.metadata.get("shard_bytes", 0),
         }
 
     @staticmethod

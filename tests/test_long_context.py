@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,9 +32,11 @@ class MultiAgentContextTests(unittest.TestCase):
         result = MultiAgentResearchSystem(DeterministicTestModel(), self.index).answer(
             "请给出项目代号、验收口令和归档校验值。"
         )
-        self.assertEqual(len(result.tasks), 3)
-        self.assertEqual(len(result.findings), 3)
-        self.assertEqual(sum(item["node"] == "fact_agent" for item in result.trace), 3)
+        allocated = result.context_metrics["agent_allocation"]["allocated_agents"]
+        self.assertGreaterEqual(allocated, 3)
+        self.assertEqual(len(result.tasks), allocated)
+        self.assertEqual(len(result.findings), allocated)
+        self.assertEqual(sum(item["node"] == "fact_agent" for item in result.trace), allocated)
         self.assertTrue(result.context_metrics["isolated_specialist_contexts"])
         self.assertEqual(result.context_metrics["control_plane"], "deterministic_code")
         self.assertTrue(result.context_metrics["all_agent_calls_within_limit"])
@@ -56,7 +59,7 @@ class MultiAgentContextTests(unittest.TestCase):
         result = system.answer("请总结全文的主要内容。")
         self.assertEqual(result.context_metrics["intent"], "document_summary")
         self.assertIn(
-            "hybrid_plus_positional_coverage",
+            "sharded_hybrid_plus_positional_coverage",
             result.context_metrics["retrieval_strategies"],
         )
         cited_indices = sorted(
@@ -89,6 +92,99 @@ class MultiAgentContextTests(unittest.TestCase):
         self.assertTrue(result.findings[0]["artifact_id"].startswith("finding_"))
         self.assertTrue(all(item.startswith("evidence_") for item in result.findings[0]["evidence_ids"]))
         self.assertTrue(result.citations)
+
+    def test_small_task_still_uses_default_agent_floor(self) -> None:
+        index = DocumentIndex()
+        index.add_text("small.txt", "项目代号是青峦-7429。")
+        result = MultiAgentResearchSystem(
+            DeterministicTestModel(),
+            index,
+            default_agents=3,
+            max_workers=8,
+        ).answer("项目代号是什么？")
+        allocation = result.context_metrics["agent_allocation"]
+        self.assertEqual(allocation["default_agents"], 3)
+        self.assertEqual(allocation["allocated_agents"], 3)
+        self.assertEqual(len(result.tasks), 3)
+        self.assertTrue(result.validation["approved"])
+
+    def test_large_source_scales_agents_and_exposes_byte_metadata(self) -> None:
+        index = DocumentIndex()
+        text = "项目代号是青峦-7429。\n" + "员工信息记录与组织字段。" * 20_000
+        index.add_text("employees.txt", text, source_bytes=len(text.encode("utf-8")))
+        result = MultiAgentResearchSystem(
+            DeterministicTestModel(),
+            index,
+            default_agents=3,
+            max_workers=8,
+        ).answer("项目代号是什么？")
+        allocation = result.context_metrics["agent_allocation"]
+        self.assertTrue(allocation["source_exceeds_shard_limit"])
+        self.assertGreater(allocation["allocated_agents"], 3)
+        self.assertLessEqual(allocation["allocated_agents"], 8)
+        self.assertTrue(result.context_metrics["all_agent_calls_within_limit"])
+        self.assertTrue(result.citations)
+        self.assertTrue(all(int(item["document_bytes"]) > 0 for item in result.citations))
+        self.assertTrue(all(int(item["chunk_bytes"]) > 0 for item in result.citations))
+        self.assertTrue(any(int(item["shard_count"]) > 1 for item in result.citations))
+
+    def test_exhaustive_employee_scan_survives_sharded_reduction(self) -> None:
+        class EmployeeModel:
+            last_usage = None
+
+            def chat(self, messages, *, temperature=0.1, max_tokens=2_000):
+                del temperature, max_tokens
+                system = messages[0]["content"]
+                prompt = messages[-1]["content"]
+                employee_ids = list(dict.fromkeys(re.findall(r"EMP-\d{4}", prompt)))
+                evidence_ids = list(dict.fromkeys(re.findall(r"evidence_[a-f0-9]+", prompt)))
+                if "ROLE:SPECIALIST:" in system:
+                    return json.dumps({
+                        "summary": "；".join(employee_ids),
+                        "claims": employee_ids,
+                        "evidence_ids": evidence_ids,
+                        "confidence": 1.0,
+                    }, ensure_ascii=False)
+                if "ROLE:REDUCER" in system:
+                    return json.dumps({
+                        "summary": "；".join(employee_ids),
+                        "claims": employee_ids,
+                        "evidence_ids": evidence_ids,
+                    }, ensure_ascii=False)
+                if "ROLE:VALIDATOR" in system:
+                    payload = json.loads(prompt)
+                    passed = bool(payload.get("hard_validation", {}).get("passed"))
+                    return json.dumps({
+                        "semantic_pass": passed,
+                        "missing_task_ids": [],
+                        "contradictions": [],
+                        "notes": "员工分片结果完整进入验证阶段",
+                    }, ensure_ascii=False)
+                if "ROLE:FINALIZER" in system:
+                    return "；".join(employee_ids)
+                raise AssertionError("unexpected role")
+
+        records = [
+            f"## 员工 {index:04d}\n\n员工编号 EMP-{index:04d}，在职状态正常。\n" + "岗位资料。" * 260
+            for index in range(1, 61)
+        ]
+        text = "\n\n".join(records)
+        index = DocumentIndex()
+        index.add_text("employees.md", text, source_bytes=len(text.encode("utf-8")))
+        result = MultiAgentResearchSystem(
+            EmployeeModel(),
+            index,
+            default_agents=3,
+            max_workers=16,
+            reduce_fan_in=4,
+        ).answer("所有员工信息有哪些？请形成完整清单。")
+        allocation = result.context_metrics["agent_allocation"]
+        self.assertTrue(allocation["exhaustive_scan"])
+        self.assertGreater(allocation["allocated_agents"], 3)
+        self.assertIn("sharded_exhaustive_scan", result.context_metrics["retrieval_strategies"])
+        self.assertIn("EMP-0001", result.answer)
+        self.assertIn("EMP-0060", result.answer)
+        self.assertTrue(result.validation["approved"])
 
     def test_main_agent_routes_to_allowed_professional_agent(self) -> None:
         result = MultiAgentResearchSystem(DeterministicTestModel(), self.index).answer(
@@ -159,7 +255,7 @@ class MultiAgentContextTests(unittest.TestCase):
         for expected in case["expected_terms"]:
             self.assertIn(expected, result.answer)
         reducer_steps = [item for item in result.trace if item["node"] == "reducer"]
-        self.assertEqual(len(reducer_steps), 2)
+        self.assertGreaterEqual(len(reducer_steps), 2)
 
 
 if __name__ == "__main__":

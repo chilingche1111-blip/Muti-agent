@@ -120,6 +120,9 @@ class FileParserTests(unittest.TestCase):
         self.assertEqual(document["source_format"], "docx")
         self.assertGreater(document["chunks"], 0)
         self.assertGreater(document["sections"], 0)
+        self.assertGreater(document["bytes"], 0)
+        self.assertGreater(document["indexed_bytes"], 0)
+        self.assertEqual(document["shard_byte_limit"], 65_536)
 
     def test_rejects_unknown_or_corrupt_files(self) -> None:
         with self.assertRaises(DocumentParseError):

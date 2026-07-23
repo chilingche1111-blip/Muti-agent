@@ -17,6 +17,8 @@ class WebApplicationTests(unittest.TestCase):
         self.assertIn("api_profile_token", test_js)
         self.assertNotIn('data-mode="offline"', index_html)
         self.assertIn("流程演示与验收", index_html)
+        self.assertIn('id="default-agents"', index_html)
+        self.assertIn('id="result-agent-allocation"', index_html)
 
     def test_tester_login_uses_role_session_and_logout(self) -> None:
         auth = AuthManager("tester", "123456", session_ttl=60)
@@ -47,12 +49,17 @@ class WebApplicationTests(unittest.TestCase):
         document = application.load_bundled_test()
         self.assertTrue(document["exceeds_64k_tokens"])
         result = application.answer({"mode": "offline", "question": "请给出项目代号、验收口令和归档校验值。", "max_workers": 8, "reduce_fan_in": 2})
-        self.assertEqual(len(result["tasks"]), 3)
+        self.assertEqual(
+            len(result["tasks"]),
+            result["capacity_report"]["allocated_agents"],
+        )
+        self.assertGreaterEqual(result["capacity_report"]["allocated_agents"], 3)
         self.assertTrue(result["validation"]["approved"])
         self.assertEqual(result["context_metrics"]["control_plane"], "deterministic_code")
         self.assertTrue(result["capacity_report"]["divide_and_conquer_verified"])
         self.assertFalse(result["capacity_report"]["supervisor_received_raw_document"])
         self.assertTrue(result["context_metrics"]["all_agent_calls_within_limit"])
+        self.assertTrue(result["capacity_report"]["source_exceeds_shard_limit"])
 
     def test_general_chat_works_without_a_document(self) -> None:
         class FakeClient:
@@ -103,6 +110,7 @@ class WebApplicationTests(unittest.TestCase):
                 "api": {"base_url": "https://example.internal/v1", "api_key": "secret", "model": "qwen"},
             })
         self.assertEqual(result["citations"][0]["url"], "https://example.com")
+        self.assertGreater(result["citations"][0]["chunk_bytes"], 0)
         self.assertTrue(result["context_metrics"]["web_search_enabled"])
         self.assertEqual(result["web_sources"][0]["title"], "官方来源")
 
@@ -122,6 +130,7 @@ class WebApplicationTests(unittest.TestCase):
         self.assertIn("这是第 20 页的唯一内容", result["answer"])
         self.assertNotIn("这是第 15 页的唯一内容", result["answer"])
         self.assertEqual(result["capacity_report"]["model_calls"], 0)
+        self.assertGreater(result["citations"][0]["document_bytes"], 0)
 
     def test_benchmark_accepts_controlled_graph_configuration(self) -> None:
         application = ResearchApplication()

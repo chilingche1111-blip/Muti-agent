@@ -31,6 +31,7 @@ class Chunk:
     index: int
     text: str
     estimated_tokens: int
+    byte_size: int = 0
     parent_id: str = ""
     section_title: str = ""
     kind: str = "raw"
@@ -141,15 +142,22 @@ class DocumentIndex:
     def __init__(self) -> None:
         self.chunks: list[Chunk] = []
         self.parents: dict[str, ParentSection] = {}
+        self.sources: dict[str, dict[str, int | str]] = {}
         self._chunk_by_id: dict[str, Chunk] = {}
         self._term_counts: list[Counter[str]] = []
         self._document_frequency: Counter[str] = Counter()
         self._tfidf_norms: list[float] = []
         self._parent_terms: dict[str, Counter[str]] = {}
 
-    def add_text(self, name: str, text: str) -> list[Chunk]:
+    def add_text(self, name: str, text: str, *, source_bytes: int | None = None) -> list[Chunk]:
         start = len(self.chunks)
         created: list[Chunk] = []
+        indexed_bytes = len(text.encode("utf-8"))
+        self.sources[name] = {
+            "document": name,
+            "source_bytes": max(0, int(source_bytes)) if source_bytes is not None else indexed_bytes,
+            "indexed_bytes": indexed_bytes,
+        }
         sections = split_sections(text)
         for parent_index, (title, section_text) in enumerate(sections):
             parent_id = f"parent_{len(self.parents):05d}"
@@ -170,6 +178,7 @@ class DocumentIndex:
                     index=chunk_index,
                     text=part,
                     estimated_tokens=estimate_tokens(part),
+                    byte_size=len(part.encode("utf-8")),
                     parent_id=parent_id,
                     section_title=title,
                 )
@@ -181,7 +190,26 @@ class DocumentIndex:
         return created
 
     def add_file(self, path: Path) -> list[Chunk]:
-        return self.add_text(path.name, path.read_text(encoding="utf-8"))
+        return self.add_text(
+            path.name,
+            path.read_text(encoding="utf-8"),
+            source_bytes=path.stat().st_size,
+        )
+
+    @property
+    def total_indexed_bytes(self) -> int:
+        return sum(int(source["indexed_bytes"]) for source in self.sources.values())
+
+    @property
+    def largest_source_indexed_bytes(self) -> int:
+        return max((int(source["indexed_bytes"]) for source in self.sources.values()), default=0)
+
+    def source_for(self, document_name: str) -> dict[str, int | str]:
+        return dict(self.sources.get(document_name, {
+            "document": document_name,
+            "source_bytes": 0,
+            "indexed_bytes": 0,
+        }))
 
     @property
     def hierarchy_stats(self) -> dict[str, int]:
@@ -218,13 +246,29 @@ class DocumentIndex:
             for parent_id, parent in self.parents.items()
         }
 
-    def search(self, query: str, *, limit: int = 10) -> list[SearchHit]:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        chunk_start: int | None = None,
+        chunk_end: int | None = None,
+    ) -> list[SearchHit]:
         """Search raw child chunks with BM25 + TF-IDF cosine + RRF."""
         query_counts = Counter(lexical_tokens(query))
         if not query_counts or not self.chunks:
             return []
 
-        average_length = sum(sum(counts.values()) for counts in self._term_counts) / len(self.chunks)
+        start = max(0, int(chunk_start or 0))
+        end = min(len(self.chunks), int(chunk_end) if chunk_end is not None else len(self.chunks))
+        candidate_indices = list(range(start, end))
+        if not candidate_indices:
+            return []
+
+        average_length = (
+            sum(sum(self._term_counts[index].values()) for index in candidate_indices)
+            / len(candidate_indices)
+        )
         size = len(self.chunks)
         bm25_scores: dict[int, float] = {}
         cosine_scores: dict[int, float] = {}
@@ -235,7 +279,8 @@ class DocumentIndex:
         }
         query_norm = math.sqrt(sum(weight * weight for weight in query_weights.values())) or 1.0
 
-        for index, counts in enumerate(self._term_counts):
+        for index in candidate_indices:
+            counts = self._term_counts[index]
             length = max(1, sum(counts.values()))
             bm25 = 0.0
             dot_product = 0.0

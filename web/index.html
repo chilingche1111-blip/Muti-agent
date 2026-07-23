@@ -102,11 +102,12 @@
               <div class="context-flow" aria-label="完整资料与模型窗口比较">
                 <div><span>完整资料</span><strong id="result-document-tokens">—</strong></div><svg viewBox="0 0 48 24" aria-hidden="true"><path d="M2 12h42m-7-7l7 7-7 7"/></svg><div><span>最大单次 Prompt</span><strong id="result-prompt-tokens">—</strong></div><svg viewBox="0 0 48 24" aria-hidden="true"><path d="M2 12h42m-7-7l7 7-7 7"/></svg><div><span>64K 模型窗口</span><strong id="result-window-usage">—</strong></div>
               </div>
-              <div class="proof-meta"><span>子任务 <strong id="result-task-count">—</strong></span><span>专业 Agent 隔离 <strong id="result-isolation">—</strong></span><span>主 Agent 接收原文 <strong id="result-supervisor-raw">—</strong></span><span>模型调用 <strong id="result-call-count">—</strong></span></div>
+              <div class="proof-meta"><span>自动 Agent <strong id="result-agent-allocation">—</strong></span><span>子任务 <strong id="result-task-count">—</strong></span><span>专业 Agent 隔离 <strong id="result-isolation">—</strong></span><span>主 Agent 接收原文 <strong id="result-supervisor-raw">—</strong></span><span>模型调用 <strong id="result-call-count">—</strong></span></div>
+              <p id="agent-allocation-reason" class="allocation-note"></p>
             </section>
 
             <div class="result-grid">
-              <section><div class="result-subheading"><h3>原文引用</h3><span id="citation-count">0 条</span></div><div id="citations" class="citations"></div></section>
+              <section><div class="result-subheading"><h3>检索来源</h3><span id="citation-count">0 条</span></div><div id="citations" class="citations"></div></section>
               <details class="trace-details"><summary>查看多 Agent 图执行轨迹</summary><div id="trace" class="trace"></div></details>
             </div>
           </div>
@@ -143,7 +144,7 @@
           </div>
           <div class="composer-footer">
             <p id="mode-hint">智能回答 · 自动判断通用问答或文档 Agent。</p>
-            <details class="advanced-settings"><summary>运行参数</summary><div class="advanced-popover"><div class="field"><label for="max-workers">最大 Worker 数</label><input id="max-workers" type="number" min="1" max="32" value="8" /></div><div class="field"><label for="reduce-fan-in">Reducer 扇入</label><input id="reduce-fan-in" type="number" min="2" max="8" value="4" /></div></div></details>
+            <details class="advanced-settings"><summary>运行参数</summary><div class="advanced-popover"><div class="field"><label for="default-agents">默认 Agent 数</label><input id="default-agents" type="number" min="1" max="32" value="3" /></div><div class="field"><label for="max-workers">最大 Agent 数</label><input id="max-workers" type="number" min="1" max="32" value="16" /></div><div class="field"><label for="reduce-fan-in">Reducer 扇入</label><input id="reduce-fan-in" type="number" min="2" max="8" value="4" /></div><p class="parameter-note">系统按任务规模自动分配，单一来源索引文本超过 64 KB 时自动分片。</p></div></details>
           </div>
         </footer>
       </section>

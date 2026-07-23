@@ -7,7 +7,7 @@ const elements = {
   baseUrl: $("#base-url"), apiKey: $("#api-key"), model: $("#model-name"), timeout: $("#timeout"),
   profileName: $("#profile-name"), profileSelect: $("#profile-select"), connectionStatus: $("#connection-status"),
   documentStatus: $("#document-status"), fileInput: $("#document-file"), dropZone: $("#drop-zone"),
-  question: $("#question"), maxWorkers: $("#max-workers"), reduceFanIn: $("#reduce-fan-in"),
+  question: $("#question"), defaultAgents: $("#default-agents"), maxWorkers: $("#max-workers"), reduceFanIn: $("#reduce-fan-in"),
   resultPanel: $("#result-panel"), resultEmpty: $(".result-empty"), resultContent: $(".result-content"),
   answerContent: $("#answer-content"), citations: $("#citations"), trace: $("#trace"),
   citationCount: $("#citation-count"), modeHint: $("#mode-hint"),
@@ -66,10 +66,13 @@ function renderDocument(info, announce = true) {
   $("#metric-chunks").textContent = `${number(info.chunks)} / ${number(info.sections)}`;
   setStatus(elements.documentStatus, "success", `${String(info.source_format || "text").toUpperCase()} 已索引`);
   const verdict = $("#limit-verdict");
-  verdict.className = `limit-verdict ${info.exceeds_64k_tokens ? "success" : "neutral"}`;
-  verdict.lastChild.textContent = info.exceeds_64k_tokens
-    ? `资料约 ${number(info.estimated_tokens)} Token，将由多个隔离 Agent 分担`
-    : "资料未超过64K，也可验证多 Agent 执行链路";
+  const needsSharding = Boolean(info.exceeds_shard_byte_limit || info.exceeds_64k_tokens);
+  verdict.className = `limit-verdict ${needsSharding ? "success" : "neutral"}`;
+  verdict.lastChild.textContent = info.exceeds_shard_byte_limit
+    ? `索引文本 ${bytes(info.indexed_bytes)} 超过 ${bytes(info.shard_byte_limit)}，回答时将自动分片并分配多个 Agent`
+    : (info.exceeds_64k_tokens
+      ? `资料约 ${number(info.estimated_tokens)} Token，将由多个隔离 Agent 分担`
+      : "资料规模较小，仍会启用默认数量的隔离 Agent");
   $("#empty-title").textContent = "资料已就绪，可以开始提问";
   $("#empty-copy").textContent = `${info.name} 已建立 ${number(info.chunks)} 个证据块；自动模式会优先使用文档 Agent。`;
   updateComposerHint();
@@ -236,13 +239,20 @@ function renderResult(result) {
   $("#result-prompt-tokens").textContent = `${number(report.max_single_agent_prompt_tokens)} Token`;
   $("#result-window-usage").textContent = `${Number(report.max_window_utilization_percent || 0).toFixed(1)}%`;
   $("#result-task-count").textContent = `${number(report.task_count)} 个`;
+  $("#result-agent-allocation").textContent = `${number(report.default_agents)} → ${number(report.allocated_agents)} 个`;
   $("#result-isolation").textContent = report.isolated_specialist_contexts ? "是" : "否";
   $("#result-supervisor-raw").textContent = report.supervisor_received_raw_document ? "是" : "否";
   $("#result-call-count").textContent = `${number(report.model_calls)} 次`;
+  $("#agent-allocation-reason").textContent = report.agent_allocation_reason
+    ? `分配依据：${report.agent_allocation_reason}`
+    : "";
   const proof = $("#context-proof-state");
   if (documentRead) {
     proof.className = "proof-pass";
     proof.textContent = "直接读取解析文本；未调用模型，不占用 LLM 上下文";
+  } else if (report.source_exceeds_shard_limit && report.multi_agent_sharding_active && report.all_agent_calls_within_limit) {
+    proof.className = "proof-pass";
+    proof.textContent = `单一来源超过 ${bytes(report.shard_byte_limit)} 分片阈值；已由 ${number(report.allocated_agents)} 个 Agent 分担并完成回答`;
   } else if (report.divide_and_conquer_verified) {
     proof.className = "proof-pass";
     proof.textContent = "资料超过64K；所有Agent调用均未越界";
@@ -263,7 +273,21 @@ function renderResult(result) {
     sourceLabel.textContent = `${citation.document} · ${citation.section || citation.chunk_id}`;
     if (citation.url) { sourceLabel.href = citation.url; sourceLabel.target = "_blank"; sourceLabel.rel = "noopener noreferrer"; }
     meta.append(sourceLabel, Object.assign(document.createElement("span"), { textContent: citation.artifact_id }));
-    card.append(meta, Object.assign(document.createElement("p"), { textContent: citation.excerpt })); elements.citations.append(card);
+    const stats = document.createElement("div"); stats.className = "citation-stats";
+    const statItems = [
+      `文件 ${bytes(Number(citation.document_bytes || citation.indexed_bytes || 0))}`,
+      `索引 ${bytes(Number(citation.indexed_bytes || 0))}`,
+      `证据块 ${bytes(Number(citation.chunk_bytes || 0))}`,
+    ];
+    if (Number(citation.shard_count || 0) > 1) statItems.push(`Agent ${number(citation.shard_index)} / ${number(citation.shard_count)}`);
+    if (citation.source_exceeds_shard_limit) statItems.push(`超过 ${bytes(Number(citation.shard_byte_limit || 0))} · 已分片`);
+    statItems.forEach((label, index) => {
+      const badge = document.createElement("span");
+      badge.className = index === statItems.length - 1 && citation.source_exceeds_shard_limit ? "split" : "";
+      badge.textContent = label;
+      stats.append(badge);
+    });
+    card.append(meta, stats, Object.assign(document.createElement("p"), { textContent: citation.excerpt })); elements.citations.append(card);
   });
   if (!citations.length) elements.citations.append(Object.assign(document.createElement("p"), { textContent: generalChat ? "通用回答未使用文档证据。" : "没有返回可验证的证据引用。" }));
 
@@ -282,7 +306,11 @@ async function runResearch() {
     const question = elements.question.value.trim();
     if (!question) throw new Error("请输入调研问题。");
     state.lastQuestion = question;
-    const payload = { mode: state.mode, answer_scope: state.scope, web_search: $("#web-search-toggle").checked, question, history: state.history, max_workers: Number(elements.maxWorkers.value), reduce_fan_in: Number(elements.reduceFanIn.value) };
+    const defaultAgents = Number(elements.defaultAgents.value);
+    const maxWorkers = Number(elements.maxWorkers.value);
+    if (!Number.isInteger(defaultAgents) || defaultAgents < 1 || defaultAgents > 32) throw new Error("默认 Agent 数必须在 1至32 之间。");
+    if (!Number.isInteger(maxWorkers) || maxWorkers < defaultAgents || maxWorkers > 32) throw new Error("最大 Agent 数必须大于等于默认 Agent 数，且不超过32。");
+    const payload = { mode: state.mode, answer_scope: state.scope, web_search: $("#web-search-toggle").checked, question, history: state.history, default_agents: defaultAgents, max_workers: maxWorkers, reduce_fan_in: Number(elements.reduceFanIn.value) };
     if (state.mode === "live") {
       const config = apiConfig();
       if (config.base_url && config.api_key && config.model) payload.api = validateApiConfig();

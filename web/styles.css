@@ -171,13 +171,17 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-dark); outl
 .context-flow span { color: var(--muted); font-size: 8px; }
 .context-flow strong { margin-top: 3px; font-size: 12px; }
 .context-flow svg { width: 30px; color: var(--gold-dark); }
-.proof-meta { margin-top: 10px; display: flex; justify-content: flex-end; gap: 18px; color: var(--muted); font-size: 9px; }
+.proof-meta { margin-top: 10px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px 18px; color: var(--muted); font-size: 9px; }
 .proof-meta strong { color: var(--ink); }
+.allocation-note { margin: 8px 0 0; padding-top: 8px; border-top: 1px solid #e9e0bd; color: var(--muted); font-size: 8px; line-height: 1.55; }
 .result-grid { display: grid; gap: 12px; }
 .result-subheading > span { color: var(--muted); font-size: 9px; }
 .citations, .trace { margin-top: 9px; display: grid; gap: 7px; }
 .citation-card, .trace-step { min-width: 0; padding: 11px; overflow-wrap: anywhere; word-break: break-word; border: 1px solid var(--line); border-radius: 8px; background: white; }
 .citation-meta { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 8px; }
+.citation-stats { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 5px; }
+.citation-stats span { padding: 3px 6px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-alt); color: var(--muted); font-size: 8px; font-weight: 650; }
+.citation-stats span.split { border-color: #d8cb99; background: var(--gold-pale); color: var(--gold-dark); }
 .citation-card p { margin: 6px 0 0; color: var(--ink-soft); font-size: 10px; white-space: pre-wrap; }
 .trace-details { padding: 11px 13px; border: 1px solid var(--line); border-radius: 8px; background: white; }
 .trace-details summary { font-size: 10px; font-weight: 700; }
@@ -219,6 +223,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-dark); outl
 .composer-footer p { margin: 0; color: var(--muted); font-size: 8px; }
 .advanced-settings > summary { color: var(--muted); font-size: 8px; font-weight: 700; }
 .advanced-popover { position: absolute; right: 0; bottom: 20px; z-index: 5; width: 290px; padding: 12px; display: grid; gap: 9px; border: 1px solid var(--line); border-radius: 9px; background: white; box-shadow: var(--shadow-md); }
+.advanced-popover .parameter-note { margin: 1px 0 0; padding-top: 8px; border-top: 1px solid var(--line); line-height: 1.5; }
 input[type="range"] { padding: 0; accent-color: var(--gold-dark); }
 
 /* Verification center */
