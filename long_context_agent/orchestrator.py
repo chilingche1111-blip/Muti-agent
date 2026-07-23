@@ -144,6 +144,7 @@ class MultiAgentResearchSystem:
         self._intent = "unknown"
         self._retrieval_strategies: set[str] = set()
         self._allocation: dict[str, Any] = {}
+        self._conversation_context = ""
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -178,7 +179,7 @@ class MultiAgentResearchSystem:
         graph.add_edge("finalizer", END)
         return graph.compile(checkpointer=MemorySaver())
 
-    def answer(self, question: str) -> MultiAgentResult:
+    def answer(self, question: str, *, conversation_context: str = "") -> MultiAgentResult:
         if not question.strip():
             raise ValueError("问题不能为空")
         self._calls = []
@@ -187,6 +188,7 @@ class MultiAgentResearchSystem:
         self._intent = "unknown"
         self._retrieval_strategies = set()
         self._allocation = {}
+        self._conversation_context = str(conversation_context).strip()[:6_000]
         self.artifacts.clear()
         state = self._graph.invoke(
             {"question": question.strip(), "findings": [], "trace": [], "iteration": 0},
@@ -231,7 +233,16 @@ class MultiAgentResearchSystem:
                         f"agent_type只允许：{allowed}。最多{self.max_workers}项。"
                     ),
                 },
-                {"role": "user", "content": f"研究目标：{question}"},
+                {
+                    "role": "user",
+                    "content": (
+                        (
+                            f"有界对话记忆（仅用于消解指代，不视为文档证据）：\n"
+                            f"{self._conversation_context}\n\n"
+                        )
+                        if self._conversation_context else ""
+                    ) + f"研究目标：{question}",
+                },
             ]
             parsed, _ = self._call_json(
                 "supervisor", messages, max_tokens=1_500, required_keys=("tasks",)
@@ -504,7 +515,13 @@ class MultiAgentResearchSystem:
                 "role": "user",
                 "content": (
                     f"task_id：{task['task_id']}\n目标：{task['objective']}\n"
-                    f"检索词：{task['query']}\n\n本任务可见证据：\n{packed or '无匹配证据'}"
+                    f"检索词：{task['query']}\n"
+                    + (
+                        f"有界对话记忆（只用于理解当前问题，不可作为事实证据）：\n"
+                        f"{self._conversation_context}\n"
+                        if self._conversation_context else ""
+                    )
+                    + f"\n本任务可见证据：\n{packed or '无匹配证据'}"
                 ),
             },
         ]
@@ -565,6 +582,9 @@ class MultiAgentResearchSystem:
     ) -> tuple[list[SearchHit], str]:
         """Combine exact retrieval with positional coverage for broad document questions."""
         query = str(task.get("query", ""))
+        referential_terms = ("这个", "该内容", "上述", "前面", "刚才", "它", "其", "这些", "他们")
+        if self._conversation_context and any(term in query for term in referential_terms):
+            query = f"{query}\n{self._conversation_context}"
         chunk_start = max(0, int(task.get("chunk_start", 0)))
         chunk_end = min(
             len(self.index.chunks),
@@ -873,7 +893,11 @@ class MultiAgentResearchSystem:
                 "与“文档证据”明确分开。验证未通过时说明具体缺口后，仍应回答证据可以支持的部分。"
             )},
             {"role": "user", "content": (
-                f"用户问题：{state['question']}\n\n归并结论："
+                (
+                    f"有界对话记忆（仅用于理解指代）：\n{self._conversation_context}\n\n"
+                    if self._conversation_context else ""
+                )
+                + f"用户问题：{state['question']}\n\n归并结论："
                 f"{json.dumps(state.get('reduced', {}), ensure_ascii=False)}\n\nValidator："
                 f"{json.dumps(validation, ensure_ascii=False)}"
             )},
@@ -976,6 +1000,12 @@ class MultiAgentResearchSystem:
             "structured_output_retries": self._json_retries,
             "retrieval_strategies": sorted(self._retrieval_strategies),
             "agent_allocation": dict(self._allocation),
+            "conversation_memory": {
+                "enabled": bool(self._conversation_context),
+                "characters": len(self._conversation_context),
+                "estimated_tokens": estimate_tokens(self._conversation_context),
+                "stored_outside_model_window": True,
+            },
             "by_role": by_role,
             "calls": self._calls,
         }

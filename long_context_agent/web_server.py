@@ -307,6 +307,29 @@ class ResearchApplication:
         )
         return compact.startswith(general_starts)
 
+    @staticmethod
+    def _bounded_conversation_context(payload: dict[str, Any]) -> str:
+        """Keep recent dialogue outside the document index and inject only a bounded view."""
+        lines: list[str] = []
+        used = 0
+        raw_history = payload.get("history", [])
+        if not isinstance(raw_history, list):
+            return ""
+        for item in reversed(raw_history[-20:]):
+            if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
+                continue
+            role = "用户" if item.get("role") == "user" else "助手"
+            limit = 1_200 if role == "用户" else 2_000
+            content = re.sub(r"\s+", " ", str(item.get("content", "")).strip())[:limit]
+            if not content:
+                continue
+            line = f"{role}：{content}"
+            if used + len(line) > 6_000:
+                break
+            lines.append(line)
+            used += len(line)
+        return "\n".join(reversed(lines))
+
     def _general_chat(
         self,
         payload: dict[str, Any],
@@ -315,7 +338,10 @@ class ResearchApplication:
         web_results: list[WebSearchResult] | None = None,
     ) -> dict[str, Any]:
         history: list[dict[str, str]] = []
-        for item in payload.get("history", [])[-20:]:
+        raw_history = payload.get("history", [])
+        if not isinstance(raw_history, list):
+            raw_history = []
+        for item in raw_history[-20:]:
             if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
                 continue
             content = str(item.get("content", "")).strip()[:8_000]
@@ -416,6 +442,12 @@ class ResearchApplication:
                 "retrieval_strategies": [],
                 "web_search_enabled": bool(web_results),
                 "web_source_count": len(web_results),
+                "conversation_memory": {
+                    "enabled": bool(history),
+                    "messages": len(history),
+                    "estimated_tokens": estimate_messages_tokens(history) if history else 0,
+                    "stored_outside_model_window": True,
+                },
                 "by_role": {"general_llm": {"calls": 1, "max_prompt_tokens": measured}},
                 "calls": [],
             },
@@ -599,6 +631,7 @@ class ResearchApplication:
             index = self.index
             document = dict(self.document or {})
             document_text = self.document_text
+        conversation_context = self._bounded_conversation_context(payload)
 
         resolved_scope = scope
         if scope == "auto":
@@ -669,7 +702,7 @@ class ResearchApplication:
             default_agents=default_agents,
             reduce_fan_in=reduce_fan_in,
         )
-        result = asdict(system.answer(question))
+        result = asdict(system.answer(question, conversation_context=conversation_context))
         result["execution_mode"] = "offline_demo" if mode == "offline" else "live_multi_agent"
         result["web_sources"] = [item.as_dict() for item in web_results]
         if web_results:
@@ -767,7 +800,7 @@ APPLICATION = ResearchApplication()
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "ContextAtlas/0.8"
+    server_version = "ContextAtlas/0.9"
 
     def log_message(self, format: str, *args: Any) -> None:
         # Never include request bodies or API credentials in local logs.
