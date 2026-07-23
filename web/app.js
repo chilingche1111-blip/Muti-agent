@@ -3,6 +3,12 @@
 const CONVERSATION_STORAGE_KEY = "context-atlas-conversation-v1";
 const MAX_STORED_TURNS = 30;
 const MAX_STORED_CHARACTERS = 2_500_000;
+const AGENT_ROLE_LABELS = {
+  fact_extractor: "事实提取",
+  analyst: "综合分析",
+  risk_reviewer: "风险审查",
+  comparator: "对比分析",
+};
 const state = { mode: "live", scope: "auto", document: null, profiles: [], lastQuestion: "", turns: [] };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -12,6 +18,8 @@ const elements = {
   documentStatus: $("#document-status"), fileInput: $("#document-file"), dropZone: $("#drop-zone"),
   question: $("#question"), defaultAgents: $("#default-agents"), maxWorkers: $("#max-workers"), reduceFanIn: $("#reduce-fan-in"),
   resultPanel: $("#result-panel"), resultEmpty: $(".result-empty"), resultContent: $("#conversation-history"),
+  agentMonitor: $("#agent-monitor"), agentMonitorToggle: $("#agent-monitor-toggle"), agentMonitorSummary: $("#agent-monitor-summary"),
+  agentMonitorContext: $("#agent-monitor-context"), agentMonitorContent: $("#agent-monitor-content"),
   turnCount: $("#turn-count"), clearConversation: $("#clear-conversation"), modeHint: $("#mode-hint"),
 };
 
@@ -86,6 +94,16 @@ function compactResult(result) {
     validation: result.validation || {},
     capacity_report: result.capacity_report || {},
     document_read: result.document_read || null,
+    tasks: (result.tasks || []).slice(0, 32).map((task) => ({
+      task_id: task.task_id,
+      agent_instance_id: task.agent_instance_id,
+      agent_type: task.agent_type,
+      shard_index: task.shard_index,
+      shard_count: task.shard_count,
+      shard_bytes: task.shard_bytes,
+      shard_chunks: task.shard_chunks,
+      input_budget: task.input_budget,
+    })),
     citations: (result.citations || []).slice(0, 40).map((citation) => ({
       ...citation,
       excerpt: String(citation.excerpt || "").slice(0, 1_200),
@@ -349,11 +367,89 @@ function createContextProof(result) {
   return card;
 }
 
+function createAgentVisualization(result) {
+  const report = result.capacity_report || {};
+  const tasks = result.tasks || [];
+  const allocated = Number(report.allocated_agents || tasks.length || 0);
+  if (allocated < 2 || tasks.length < 2) return null;
+
+  const desired = Number(report.desired_agents || allocated);
+  const maximum = Math.max(allocated, Number(report.max_agents || allocated));
+  const defaultAgents = Number(report.default_agents || 0);
+  const capped = desired > allocated;
+  const saturated = allocated >= maximum;
+  const section = node("section", "agent-allocation-panel");
+  section.setAttribute("aria-label", `Agent 调度视图：系统需要 ${desired} 个，实际分配 ${allocated} 个`);
+
+  const head = node("div", "agent-allocation-head");
+  const title = node("div");
+  title.append(node("span", "section-kicker", "Agent orchestration"), node("h3", "", "Agent 调度视图"));
+  const stateLabel = capped ? "受最大数量限制" : (saturated ? "已用满配置上限" : "自动分配完成");
+  head.append(title, node("span", `allocation-state ${capped ? "capped" : (saturated ? "warning" : "success")}`, stateLabel));
+
+  const metrics = node("div", "allocation-metrics");
+  [
+    ["默认下限", `${number(defaultAgents)} 个`],
+    ["系统需求", `${number(desired)} 个`],
+    ["实际分配", `${number(allocated)} 个`],
+    ["配置上限", `${number(maximum)} 个`],
+  ].forEach(([label, value]) => {
+    const metric = node("div"); metric.append(node("span", "", label), node("strong", "", value)); metrics.append(metric);
+  });
+
+  const capacity = node("div", "allocation-capacity");
+  const capacityLabels = node("div");
+  capacityLabels.append(node("span", "", `容量占用 ${number(allocated)} / ${number(maximum)}`), node("strong", "", `${Math.round(allocated / Math.max(1, maximum) * 100)}%`));
+  const track = node("div", "allocation-track");
+  const fill = node("i"); fill.style.width = `${Math.min(100, allocated / Math.max(1, maximum) * 100)}%`; track.append(fill);
+  capacity.append(capacityLabels, track);
+
+  const pipeline = node("div", "agent-pipeline");
+  const supervisor = node("div", "pipeline-node supervisor-node");
+  supervisor.append(node("span", "pipeline-node-index", "01"), node("strong", "", "Supervisor"), node("small", "", `规划 ${number(tasks.length)} 个隔离子任务`));
+  const firstArrow = node("div", "pipeline-arrow"); firstArrow.append(icon("M5 12h14m-5-5 5 5-5 5"));
+
+  const agentStage = node("div", "agent-stage");
+  const agentStageHead = node("div", "agent-stage-head");
+  agentStageHead.append(node("span", "pipeline-node-index", "02"), node("strong", "", "专业 Agent 分片执行"), node("small", "", `${number(report.source_indexed_bytes)} Bytes 索引资料`));
+  const grid = node("div", "agent-grid");
+  tasks.forEach((task, index) => {
+    const role = String(task.agent_type || "unknown");
+    const roleClass = Object.hasOwn(AGENT_ROLE_LABELS, role) ? role.replace("_extractor", "").replace("_reviewer", "") : "unknown";
+    const card = node("article", `agent-mini-card role-${roleClass}`);
+    const cardHead = node("div");
+    cardHead.append(node("span", "agent-number", `Agent ${String(index + 1).padStart(2, "0")}`), node("span", "agent-role", AGENT_ROLE_LABELS[role] || role));
+    const shardIndex = Number(task.shard_index || index + 1);
+    const shardCount = Number(task.shard_count || tasks.length);
+    card.append(
+      cardHead,
+      node("strong", "agent-shard", `分片 ${number(shardIndex)} / ${number(shardCount)}`),
+      node("p", "", `${bytes(Number(task.shard_bytes || 0))} · ${number(task.shard_chunks)} 个 Chunk`),
+      node("span", "agent-complete", "已完成"),
+    );
+    grid.append(card);
+  });
+  agentStage.append(agentStageHead, grid);
+
+  const secondArrow = node("div", "pipeline-arrow"); secondArrow.append(icon("M5 12h14m-5-5 5 5-5 5"));
+  const finish = node("div", "pipeline-finish");
+  const reducer = node("div", "pipeline-node"); reducer.append(node("span", "pipeline-node-index", "03"), node("strong", "", "Tree Reducer"), node("small", "", "固定扇入分层汇总"));
+  const validator = node("div", `pipeline-node validator-node ${result.validation?.approved ? "approved" : "rejected"}`);
+  validator.append(node("span", "pipeline-node-index", "04"), node("strong", "", "Validator"), node("small", "", result.validation?.approved ? "验证通过" : "发现未通过项"));
+  finish.append(reducer, validator);
+  pipeline.append(supervisor, firstArrow, agentStage, secondArrow, finish);
+
+  section.append(head, metrics, capacity, pipeline);
+  if (report.agent_allocation_reason) section.append(node("p", "allocation-reason", `分配依据：${report.agent_allocation_reason}`));
+  if (capped) section.append(node("p", "allocation-warning", `系统计算需要 ${number(desired)} 个 Agent，但配置上限为 ${number(maximum)}；建议提高最大 Agent 数或缩小单次任务范围。`));
+  return section;
+}
+
 function createCitationSection(result, generalChat) {
   const section = node("section");
   const citations = result.citations || [];
   const heading = node("div", "result-subheading");
-  heading.append(node("h3", "", "检索来源"), node("span", "", `${citations.length} 条`));
+  heading.append(node("h3", "", "证据明细"), node("span", "", `${citations.length} 条`));
   const container = node("div", "citations");
   citations.forEach((citation) => {
     const card = node("article", "citation-card");
@@ -378,6 +474,23 @@ function createCitationSection(result, generalChat) {
   return section;
 }
 
+function createSourceDisclosure(result, generalChat) {
+  const citations = result.citations || [];
+  if (!citations.length) return null;
+  const details = node("details", "turn-source-disclosure");
+  const summary = node("summary");
+  const identity = node("span", "source-disclosure-title");
+  identity.append(icon("M4 6.5h16M4 12h16M4 17.5h10"));
+  const labels = node("span");
+  labels.append(node("strong", "", "检索来源"), node("small", "", "展开查看文件、字节大小与证据摘要"));
+  identity.append(labels);
+  summary.append(identity, node("span", "source-count-badge", `${number(citations.length)} 条`));
+  const body = node("div", "source-disclosure-body");
+  body.append(createCitationSection(result, generalChat));
+  details.append(summary, body);
+  return details;
+}
+
 function createTrace(result) {
   const details = node("details", "trace-details");
   details.append(node("summary", "", "查看多 Agent 图执行轨迹"));
@@ -391,7 +504,7 @@ function createTrace(result) {
   return details;
 }
 
-function renderTurn(turn, isLatest) {
+function renderTurn(turn) {
   const result = turn.result;
   const labels = resultLabels(result);
   const article = node("article", "conversation-turn"); article.dataset.turnId = turn.id;
@@ -399,6 +512,8 @@ function renderTurn(turn, isLatest) {
   const questionMeta = node("div", "question-meta");
   questionMeta.append(node("span", "message-label", "你的问题"), node("time", "", new Date(turn.created_at).toLocaleString("zh-CN", { hour12: false })));
   question.append(questionMeta, node("p", "", turn.question));
+
+  const sourceDisclosure = createSourceDisclosure(result, labels.generalChat);
 
   const answer = node("div", "message answer-message");
   const answerHead = node("div", "message-head");
@@ -420,20 +535,56 @@ function renderTurn(turn, isLatest) {
     answer.append(nav);
   }
 
-  const evidence = node("details", "turn-evidence"); evidence.open = isLatest;
+  const evidence = node("details", "turn-evidence");
   const citationCount = (result.citations || []).length;
   const summary = node("summary");
   summary.append(node("span", "", "执行详情"), node("small", "", `${citationCount} 条来源 · ${number(result.capacity_report?.model_calls)} 次模型调用`));
   const body = node("div", "turn-evidence-body");
   if (!labels.generalChat) body.append(createContextProof(result));
-  body.append(createCitationSection(result, labels.generalChat), createTrace(result));
+  body.append(createTrace(result));
   evidence.append(summary, body);
-  article.append(question, answer, evidence);
+  article.append(question);
+  if (sourceDisclosure) article.append(sourceDisclosure);
+  article.append(evidence, answer);
   return article;
 }
 
+function renderAgentMonitor() {
+  const turn = [...state.turns].reverse().find((item) => {
+    const result = item?.result || {};
+    return Number(result.capacity_report?.allocated_agents || 0) >= 2 && (result.tasks || []).length >= 2;
+  });
+  const visualization = turn ? createAgentVisualization(turn.result) : null;
+  if (!turn || !visualization) {
+    setAgentMonitorOpen(false);
+    elements.agentMonitorToggle.disabled = true;
+    elements.agentMonitorToggle.classList.remove("ready");
+    elements.agentMonitorSummary.textContent = "暂无运行";
+    elements.agentMonitorContext.textContent = "";
+    elements.agentMonitorContent.replaceChildren();
+    return;
+  }
+  const allocated = Number(turn.result.capacity_report?.allocated_agents || turn.result.tasks.length);
+  const question = String(turn.question || "").trim();
+  elements.agentMonitorToggle.disabled = false;
+  elements.agentMonitorToggle.classList.add("ready");
+  elements.agentMonitorSummary.textContent = `${number(allocated)} Agent`;
+  elements.agentMonitorContext.textContent = `最近一次多 Agent 任务：${question.length > 90 ? `${question.slice(0, 90)}…` : question}`;
+  elements.agentMonitorContent.replaceChildren(visualization);
+}
+
+function setAgentMonitorOpen(open) {
+  const shouldOpen = Boolean(open && !elements.agentMonitorToggle.disabled);
+  const shouldReturnFocus = !shouldOpen && document.activeElement === $("#agent-monitor-close");
+  elements.agentMonitor.hidden = !shouldOpen;
+  elements.agentMonitorToggle.setAttribute("aria-expanded", String(shouldOpen));
+  if (shouldOpen) $("#agent-monitor-close").focus();
+  else if (shouldReturnFocus) elements.agentMonitorToggle.focus();
+}
+
 function renderConversation() {
-  elements.resultContent.replaceChildren(...state.turns.map((turn, index) => renderTurn(turn, index === state.turns.length - 1)));
+  elements.resultContent.replaceChildren(...state.turns.map((turn) => renderTurn(turn)));
+  renderAgentMonitor();
   updateConversationState();
 }
 
@@ -518,5 +669,8 @@ elements.clearConversation.addEventListener("click", () => {
   renderConversation();
   toast("对话记录已清空。再提问会开始新的会话。");
 });
+elements.agentMonitorToggle.addEventListener("click", () => setAgentMonitorOpen(elements.agentMonitor.hidden));
+$("#agent-monitor-close").addEventListener("click", () => setAgentMonitorOpen(false));
+document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !elements.agentMonitor.hidden) setAgentMonitorOpen(false); });
 
 setMode("live"); setScope("auto"); loadProfiles(); restoreConversation(); restoreCurrentDocument();

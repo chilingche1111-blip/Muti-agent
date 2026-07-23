@@ -51,56 +51,90 @@ Context Atlas 使用另一种协作方式：
 
 ## 工作原理
 
+### 请求路由
+
+系统不会让所有请求都进入多 Agent。路由层先判断任务是否需要模型、工具或协作编排。
+
 ```mermaid
-flowchart TD
-    U["用户当前问题"] --> UI["Web UI\n追加式会话界面"]
-    UI --> R["执行通道路由\n自动 / 通用 / 文档"]
+flowchart LR
+    U["用户当前问题"] --> UI["Web UI\n追加保存问答记录"]
+    UI --> R{"执行通道路由\n自动 / 通用 / 文档"}
+    UI --> H["浏览器本地历史\n最多 30 轮"]
+    H --> C["有界记忆构建器\n最近 10 轮 / 最多 20 条消息"]
 
-    UI --> H["浏览器本地历史\n最多保存 30 轮"]
-    H --> B["有界记忆构建器\n最近 10 轮 / 最多 20 条消息"]
+    R -->|"通用理解、生成或推理"| B["基础 LLM 通道\n对话输入执行 Token 裁剪"]
+    R -->|"原文读取、解析或规则任务"| T["确定性工具通道\n不必调用模型"]
+    R -->|"长文档研究与复杂协作"| M["LangGraph 多 Agent 通道\n确定性外循环"]
+    C --> B
+    C -. "最多 6,000 字符，仅用于消解指代" .-> M
 
-    X1["上传文档"] --> P["解析器\nPDF / Word / PPT / Text"]
-    P --> M["窗口外资料层\n原文、父子 Chunk、Artifact"]
-    X2["可选联网检索"] --> W["网页结果"]
-    W --> M
-
-    R -->|"基础模型通道"| G["基础 LLM\n对话输入预算约 24K Token"]
-    B --> G
-    W --> G
-
-    R -->|"确定性工具通道"| T["原文 / 页码读取器\n0 次模型调用"]
-    M --> T
-
-    R -->|"多 Agent 协作通道"| L["LangGraph 确定性外循环"]
-    L --> S["Supervisor\n计划、调度、状态管理"]
-    B -. "最多 6,000 字符，仅消解指代" .-> L
-    S --> AA["自动 Agent 分配\n默认下限 + 按规模扩展"]
-    AA --> E["分片内检索\n固定预算 Evidence Pack"]
-    M --> E
-
-    E --> F["Fact Agent\n独立上下文"]
-    E --> A["Analysis Agent\n独立上下文"]
-    E --> K["Risk Agent\n独立上下文"]
-    E --> C["Comparison Agent\n独立上下文"]
-
-    F --> D["树形 Reducer\n固定扇入归并"]
-    A --> D
-    K --> D
-    C --> D
-
-    D --> V["Validator\n程序硬规则 + 模型语义检查"]
-    V -->|"通过"| Z["Finalizer"]
-    V -->|"可修复缺口且未达上限"| RP["定向重规划\n仅重跑失败任务"]
-    RP --> AA
-    V -->|"达到循环边界"| Z
-
-    G --> O["本轮回答、来源与运行指标"]
+    B --> O["本轮回答、来源与运行指标"]
     T --> O
-    Z --> O
+    M --> O
     O --> UI
 ```
 
-图中的浏览器历史、窗口外资料层和模型上下文是三个不同边界。浏览器可以长期展示多轮记录，但只有经过裁剪的有界记忆会进入后续调用；文档事实仍必须来自 Evidence Pack，虚线传入的对话记忆只用于理解指代，不能充当证据。
+浏览器历史、窗口外资料和模型上下文是三个不同边界。界面可以持续保留多轮记录，但只有经过裁剪的有界记忆会进入模型调用；传给文档 Agent 的会话记忆只用于理解指代，不能充当文档证据。
+
+### 多 Agent 长上下文数据流
+
+多 Agent 通道由两个相互分离的部分组成：LangGraph 控制面负责状态和跳转，窗口外数据面负责保存原文、索引、证据与中间产物。
+
+```mermaid
+flowchart TB
+    subgraph C["控制面：LangGraph 确定性外循环"]
+        direction TB
+        S["Supervisor\n只接收目标、有界历史和元数据\n不接收完整原文"]
+        A["容量规划与任务表\n计算 Desired / Allocated Agents\n生成连续分片和角色分配"]
+        D["Send 扇出调度\n按任务创建 N 个逻辑 Agent 实例"]
+        W["隔离 Worker 1...N\n角色可重复：事实、分析、风险、比较\n每个实例只处理一个任务和一个分片"]
+        R["Tree Reducer\n固定扇入、逐层合并 Finding\n不读取完整原文"]
+        V["Validator\n程序硬校验 + 模型语义校验"]
+        P["定向重规划\n只保留失败的 task_id"]
+        F["Finalizer\n基于归并结果、证据 ID\n和验证报告形成回答"]
+
+        S --> A --> D --> W
+        W -->|"Finding + Evidence ID"| R
+        R --> V
+        V -->|"通过"| F
+        V -->|"可修复且未达到重试上限"| P
+        P --> D
+        V -->|"不可修复或达到循环边界"| F
+    end
+
+    subgraph X["数据面：窗口外记忆"]
+        direction TB
+        SRC["PDF、Word、PPT、文本与网页"]
+        PARSE["解析、父子分块与元数据标准化"]
+        IDX["检索索引\n原文和 Chunk 保留在模型窗口之外"]
+        ART["Artifact Store\nEvidence、Finding、Reduction"]
+        CP["LangGraph Checkpoint\nTask、Finding、Validation、Iteration"]
+
+        SRC --> PARSE --> IDX
+    end
+
+    IDX -->|"只提供 Bytes / Chunk 元数据"| A
+    IDX -->|"分片内检索并构造有界 Evidence Pack"| W
+    W -->|"写入 Evidence 与 Finding"| ART
+    R -->|"写入分层归并 Artifact"| ART
+    S -. "写入任务表" .-> CP
+    W -. "累积 Finding" .-> CP
+    V -. "记录验证与循环次数" .-> CP
+    F --> OUT["回答 + 引用 + 运行指标 + 执行轨迹"]
+
+    G["统一上下文预算门\n每次 LLM 调用独立检查\n输入 + 输出预留 + 安全余量 ≤ 64K"]
+    G -. "约束" .-> S
+    G -. "约束" .-> W
+    G -. "约束" .-> R
+    G -. "约束" .-> V
+    G -. "约束" .-> F
+```
+
+图中实线表示任务执行或证据流，虚线表示状态记录和预算约束。Artifact Store 与 LangGraph Checkpoint 都位于模型窗口之外：前者保存可引用内容，后者保存确定性流程状态。
+
+图中的 `N` 是运行时根据默认下限、资料字节数、Chunk 数量、任务复杂度和最大 Worker 限制计算出的实际 Agent 数，不代表四个固定 Agent。事实、分析、风险和比较只是任务路由角色；同一角色可以同时创建多个相互隔离的实例。
+
+完整原文只存在于窗口外数据面。Supervisor 只维护任务和状态；Worker 在自己的分片内检索并构造有界 Evidence Pack；Reducer 只合并结构化 Finding；Validator 失败时只把可修复的任务 ID 送回调度节点。因此，资料总量和 Agent 数量可以增长，而任意一次模型调用仍受独立的 64K 预算约束。
 
 ### 三条执行通道
 
@@ -157,7 +191,7 @@ External Memory
 ├── Child Chunks
 ├── Evidence Records
 ├── Agent Artifacts
-└── Validation Reports
+└── Graph Checkpoints and Validation State
 ```
 
 模型上下文只作为当前任务的临时工作区。Agent 需要信息时，通过检索和 Artifact ID 按需读取，而不是重新加载全部历史。
