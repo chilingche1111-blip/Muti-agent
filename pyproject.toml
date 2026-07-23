@@ -1,6 +1,6 @@
 [project]
 name = "long-context-research-agent"
-version = "0.8.0"
+version = "0.9.0"
 description = "Deterministic LangGraph multi-agent system with central supervision, specialists, and validation"
 requires-python = ">=3.9"
 dependencies = ["langgraph>=0.2.60,<0.3", "pypdf>=6.0"]

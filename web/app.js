@@ -1,6 +1,9 @@
 "use strict";
 
-const state = { mode: "live", scope: "auto", document: null, profiles: [], answer: "", lastQuestion: "", history: [] };
+const CONVERSATION_STORAGE_KEY = "context-atlas-conversation-v1";
+const MAX_STORED_TURNS = 30;
+const MAX_STORED_CHARACTERS = 2_500_000;
+const state = { mode: "live", scope: "auto", document: null, profiles: [], lastQuestion: "", turns: [] };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const elements = {
@@ -8,9 +11,8 @@ const elements = {
   profileName: $("#profile-name"), profileSelect: $("#profile-select"), connectionStatus: $("#connection-status"),
   documentStatus: $("#document-status"), fileInput: $("#document-file"), dropZone: $("#drop-zone"),
   question: $("#question"), defaultAgents: $("#default-agents"), maxWorkers: $("#max-workers"), reduceFanIn: $("#reduce-fan-in"),
-  resultPanel: $("#result-panel"), resultEmpty: $(".result-empty"), resultContent: $(".result-content"),
-  answerContent: $("#answer-content"), citations: $("#citations"), trace: $("#trace"),
-  citationCount: $("#citation-count"), modeHint: $("#mode-hint"),
+  resultPanel: $("#result-panel"), resultEmpty: $(".result-empty"), resultContent: $("#conversation-history"),
+  turnCount: $("#turn-count"), clearConversation: $("#clear-conversation"), modeHint: $("#mode-hint"),
 };
 
 function apiConfig() {
@@ -57,6 +59,79 @@ function bytes(value) {
   if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(2)} MB`;
   if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${value} B`;
+}
+
+function node(tag, className = "", text = "") {
+  const item = document.createElement(tag);
+  if (className) item.className = className;
+  if (text !== "") item.textContent = text;
+  return item;
+}
+
+function icon(pathData) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", pathData);
+  svg.append(path);
+  return svg;
+}
+
+function compactResult(result) {
+  return {
+    answer: String(result.answer || "").slice(0, 80_000),
+    execution_mode: result.execution_mode || "",
+    stop_reason: result.stop_reason || "",
+    validation: result.validation || {},
+    capacity_report: result.capacity_report || {},
+    document_read: result.document_read || null,
+    citations: (result.citations || []).slice(0, 40).map((citation) => ({
+      ...citation,
+      excerpt: String(citation.excerpt || "").slice(0, 1_200),
+    })),
+    trace: (result.trace || []).slice(0, 80).map((step) => ({
+      node: step.node,
+      role: step.role,
+      status: step.status,
+      detail: String(step.detail || "").slice(0, 1_500),
+    })),
+  };
+}
+
+function persistConversation() {
+  let turns = state.turns.slice(-MAX_STORED_TURNS);
+  let serialized = JSON.stringify(turns);
+  while (turns.length > 1 && serialized.length > MAX_STORED_CHARACTERS) {
+    turns.shift();
+    serialized = JSON.stringify(turns);
+  }
+  state.turns = turns;
+  try { localStorage.setItem(CONVERSATION_STORAGE_KEY, serialized); }
+  catch { toast("对话记录过大，最新内容仅保留在当前页面。", "error"); }
+}
+
+function modelHistory() {
+  return state.turns.slice(-10).flatMap((turn) => [
+    { role: "user", content: String(turn.question || "").slice(0, 2_000) },
+    { role: "assistant", content: String(turn.result?.answer || "").slice(0, 4_000) },
+  ]);
+}
+
+function updateConversationState() {
+  const count = state.turns.length;
+  elements.turnCount.textContent = `${number(count)} 轮对话`;
+  elements.clearConversation.disabled = count === 0;
+  elements.resultEmpty.hidden = count > 0;
+  elements.resultContent.hidden = count === 0;
+}
+
+function restoreConversation() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CONVERSATION_STORAGE_KEY) || "[]");
+    state.turns = Array.isArray(parsed) ? parsed.slice(-MAX_STORED_TURNS).filter((turn) => turn?.question && turn?.result) : [];
+  } catch { state.turns = []; }
+  renderConversation();
 }
 
 function renderDocument(info, announce = true) {
@@ -209,71 +284,84 @@ function updateComposerHint() {
   if (webState) webState.textContent = webEnabled ? "已开启 · 5个来源" : "关闭";
 }
 
-function renderResult(result) {
-  state.answer = result.answer || "";
-  elements.resultEmpty.hidden = true; elements.resultContent.hidden = false;
-  $("#result-question").textContent = elements.question.value.trim();
-  elements.answerContent.textContent = state.answer;
-  const documentRead = result.document_read;
+function resultLabels(result) {
+  const documentRead = Boolean(result.document_read);
   const generalChat = result.execution_mode === "general_chat";
   const offlineDemo = result.execution_mode === "offline_demo";
-  $("#answer-mode-label").textContent = documentRead ? "PDF / 文档原文" : (generalChat ? "LLM 直接回答" : (offlineDemo ? "流程演示结果" : "多 Agent 智能回答"));
-  setStatus(
-    $("#result-status"),
-    result.validation?.approved ? "success" : "warning",
-    documentRead ? "原文直接读取" : (generalChat ? "直接回答" : (offlineDemo ? "测试模型" : (result.validation?.approved ? "Validator 通过" : "Validator 拒绝"))),
-  );
-  const readNav = $("#document-read-nav");
-  readNav.hidden = !documentRead;
-  if (documentRead) {
-    $("#read-progress").textContent = `字符 ${number(documentRead.start_character + 1)}–${number(documentRead.end_character)} / ${number(documentRead.total_characters)}`;
-    $("#read-previous").disabled = !documentRead.has_previous;
-    $("#read-next").disabled = !documentRead.has_more;
-    $("#read-previous").dataset.offset = String(documentRead.previous_offset || 0);
-    $("#read-next").dataset.offset = String(documentRead.next_offset || 0);
-  }
+  return {
+    documentRead,
+    generalChat,
+    mode: documentRead ? "PDF / 文档原文" : (generalChat ? "LLM 直接回答" : (offlineDemo ? "流程演示结果" : "多 Agent 智能回答")),
+    status: documentRead ? "原文直接读取" : (generalChat ? "直接回答" : (offlineDemo ? "测试模型" : (result.validation?.approved ? "Validator 通过" : "Validator 拒绝"))),
+  };
+}
 
+function createContextProof(result) {
   const report = result.capacity_report || {};
-  $("#context-proof-card").hidden = generalChat;
-  $("#result-document-tokens").textContent = `${number(report.document_tokens_estimate)} Token`;
-  $("#result-prompt-tokens").textContent = `${number(report.max_single_agent_prompt_tokens)} Token`;
-  $("#result-window-usage").textContent = `${Number(report.max_window_utilization_percent || 0).toFixed(1)}%`;
-  $("#result-task-count").textContent = `${number(report.task_count)} 个`;
-  $("#result-agent-allocation").textContent = `${number(report.default_agents)} → ${number(report.allocated_agents)} 个`;
-  $("#result-isolation").textContent = report.isolated_specialist_contexts ? "是" : "否";
-  $("#result-supervisor-raw").textContent = report.supervisor_received_raw_document ? "是" : "否";
-  $("#result-call-count").textContent = `${number(report.model_calls)} 次`;
-  $("#agent-allocation-reason").textContent = report.agent_allocation_reason
-    ? `分配依据：${report.agent_allocation_reason}`
-    : "";
-  const proof = $("#context-proof-state");
-  if (documentRead) {
+  const card = node("section", "context-proof-card");
+  const head = node("div", "proof-card-head");
+  const title = node("div");
+  title.append(node("span", "section-kicker", "Context isolation"), node("h3", "", "多 Agent 上下文隔离证明"));
+  const proof = node("span", "proof-neutral", "等待统计");
+  if (result.document_read) {
     proof.className = "proof-pass";
     proof.textContent = "直接读取解析文本；未调用模型，不占用 LLM 上下文";
   } else if (report.source_exceeds_shard_limit && report.multi_agent_sharding_active && report.all_agent_calls_within_limit) {
     proof.className = "proof-pass";
-    proof.textContent = `单一来源超过 ${bytes(report.shard_byte_limit)} 分片阈值；已由 ${number(report.allocated_agents)} 个 Agent 分担并完成回答`;
+    proof.textContent = `单一来源超过 ${bytes(report.shard_byte_limit)}；${number(report.allocated_agents)} 个 Agent 已完成分片处理`;
   } else if (report.divide_and_conquer_verified) {
     proof.className = "proof-pass";
-    proof.textContent = "资料超过64K；所有Agent调用均未越界";
+    proof.textContent = "资料超过 64K；所有 Agent 调用均未越界";
   } else if (report.all_agent_calls_within_limit) {
     proof.className = "proof-neutral";
-    proof.textContent = "所有Agent调用未越界；当前资料未超过64K";
+    proof.textContent = "所有 Agent 调用未越界";
   } else {
-    proof.className = "proof-fail"; proof.textContent = "检测到单Agent上下文越界风险";
+    proof.className = "proof-fail";
+    proof.textContent = "检测到单 Agent 上下文越界风险";
   }
+  head.append(title, proof);
 
-  elements.citations.replaceChildren();
+  const flow = node("div", "context-flow");
+  const flowItems = [
+    ["完整资料", `${number(report.document_tokens_estimate)} Token`],
+    ["最大单次 Prompt", `${number(report.max_single_agent_prompt_tokens)} Token`],
+    ["64K 模型窗口", `${Number(report.max_window_utilization_percent || 0).toFixed(1)}%`],
+  ];
+  flowItems.forEach(([label, value], index) => {
+    const metric = node("div"); metric.append(node("span", "", label), node("strong", "", value)); flow.append(metric);
+    if (index < flowItems.length - 1) {
+      const arrow = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      arrow.setAttribute("viewBox", "0 0 48 24");
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", "M2 12h42m-7-7l7 7-7 7"); arrow.append(path); flow.append(arrow);
+    }
+  });
+
+  const meta = node("div", "proof-meta");
+  [
+    ["自动 Agent", `${number(report.default_agents)} → ${number(report.allocated_agents)} 个`],
+    ["子任务", `${number(report.task_count)} 个`],
+    ["专业 Agent 隔离", report.isolated_specialist_contexts ? "是" : "否"],
+    ["主 Agent 接收原文", report.supervisor_received_raw_document ? "是" : "否"],
+    ["模型调用", `${number(report.model_calls)} 次`],
+  ].forEach(([label, value]) => { const item = node("span", "", `${label} `); item.append(node("strong", "", value)); meta.append(item); });
+  card.append(head, flow, meta);
+  if (report.agent_allocation_reason) card.append(node("p", "allocation-note", `分配依据：${report.agent_allocation_reason}`));
+  return card;
+}
+
+function createCitationSection(result, generalChat) {
+  const section = node("section");
   const citations = result.citations || [];
-  elements.citationCount.textContent = `${citations.length} 条`;
+  const heading = node("div", "result-subheading");
+  heading.append(node("h3", "", "检索来源"), node("span", "", `${citations.length} 条`));
+  const container = node("div", "citations");
   citations.forEach((citation) => {
-    const card = document.createElement("article"); card.className = "citation-card";
-    const meta = document.createElement("div"); meta.className = "citation-meta";
-    const sourceLabel = citation.url ? document.createElement("a") : document.createElement("span");
-    sourceLabel.textContent = `${citation.document} · ${citation.section || citation.chunk_id}`;
+    const card = node("article", "citation-card");
+    const meta = node("div", "citation-meta");
+    const sourceLabel = node(citation.url ? "a" : "span", "", `${citation.document} · ${citation.section || citation.chunk_id}`);
     if (citation.url) { sourceLabel.href = citation.url; sourceLabel.target = "_blank"; sourceLabel.rel = "noopener noreferrer"; }
-    meta.append(sourceLabel, Object.assign(document.createElement("span"), { textContent: citation.artifact_id }));
-    const stats = document.createElement("div"); stats.className = "citation-stats";
+    meta.append(sourceLabel, node("span", "", citation.artifact_id || "evidence"));
+    const stats = node("div", "citation-stats");
     const statItems = [
       `文件 ${bytes(Number(citation.document_bytes || citation.indexed_bytes || 0))}`,
       `索引 ${bytes(Number(citation.indexed_bytes || 0))}`,
@@ -281,23 +369,86 @@ function renderResult(result) {
     ];
     if (Number(citation.shard_count || 0) > 1) statItems.push(`Agent ${number(citation.shard_index)} / ${number(citation.shard_count)}`);
     if (citation.source_exceeds_shard_limit) statItems.push(`超过 ${bytes(Number(citation.shard_byte_limit || 0))} · 已分片`);
-    statItems.forEach((label, index) => {
-      const badge = document.createElement("span");
-      badge.className = index === statItems.length - 1 && citation.source_exceeds_shard_limit ? "split" : "";
-      badge.textContent = label;
-      stats.append(badge);
-    });
-    card.append(meta, stats, Object.assign(document.createElement("p"), { textContent: citation.excerpt })); elements.citations.append(card);
+    statItems.forEach((label, index) => stats.append(node("span", index === statItems.length - 1 && citation.source_exceeds_shard_limit ? "split" : "", label)));
+    card.append(meta, stats, node("p", "", citation.excerpt || ""));
+    container.append(card);
   });
-  if (!citations.length) elements.citations.append(Object.assign(document.createElement("p"), { textContent: generalChat ? "通用回答未使用文档证据。" : "没有返回可验证的证据引用。" }));
+  if (!citations.length) container.append(node("p", "empty-evidence", generalChat ? "通用回答未使用文档证据。" : "没有返回可验证的证据引用。"));
+  section.append(heading, container);
+  return section;
+}
 
-  elements.trace.replaceChildren();
+function createTrace(result) {
+  const details = node("details", "trace-details");
+  details.append(node("summary", "", "查看多 Agent 图执行轨迹"));
+  const trace = node("div", "trace");
   (result.trace || []).forEach((step, index) => {
-    const item = document.createElement("div"); item.className = "trace-step"; item.dataset.step = String(index + 1);
-    item.append(Object.assign(document.createElement("strong"), { textContent: `${step.role || step.node} · ${step.status}` }), Object.assign(document.createElement("span"), { textContent: step.detail || "" }));
-    elements.trace.append(item);
+    const item = node("div", "trace-step"); item.dataset.step = String(index + 1);
+    item.append(node("strong", "", `${step.role || step.node} · ${step.status}`), node("span", "", step.detail || ""));
+    trace.append(item);
   });
-  elements.resultPanel.scrollTo({ top: 0, behavior: "smooth" });
+  details.append(trace);
+  return details;
+}
+
+function renderTurn(turn, isLatest) {
+  const result = turn.result;
+  const labels = resultLabels(result);
+  const article = node("article", "conversation-turn"); article.dataset.turnId = turn.id;
+  const question = node("div", "message question-message");
+  const questionMeta = node("div", "question-meta");
+  questionMeta.append(node("span", "message-label", "你的问题"), node("time", "", new Date(turn.created_at).toLocaleString("zh-CN", { hour12: false })));
+  question.append(questionMeta, node("p", "", turn.question));
+
+  const answer = node("div", "message answer-message");
+  const answerHead = node("div", "message-head");
+  const actions = node("div");
+  const status = node("span", "status-pill");
+  setStatus(status, result.validation?.approved === false ? "warning" : "success", labels.status);
+  const copy = node("button", "icon-text-button", "复制"); copy.type = "button"; copy.dataset.action = "copy-turn"; copy.dataset.turnId = turn.id;
+  copy.prepend(icon("M8 8h11v11H8zM5 16H4V5h11v1"));
+  actions.append(status, copy);
+  answerHead.append(node("span", "message-label", labels.mode), actions);
+  answer.append(answerHead, node("div", "answer-content", result.answer || ""));
+
+  const read = result.document_read;
+  if (read) {
+    const nav = node("div", "document-read-nav");
+    const previous = node("button", "button secondary", "上一段"); previous.type = "button"; previous.disabled = !read.has_previous; previous.dataset.action = "read-document"; previous.dataset.offset = String(read.previous_offset || 0); previous.dataset.question = turn.question;
+    const next = node("button", "button secondary", "下一段"); next.type = "button"; next.disabled = !read.has_more; next.dataset.action = "read-document"; next.dataset.offset = String(read.next_offset || 0); next.dataset.question = turn.question;
+    nav.append(previous, node("span", "", `字符 ${number(read.start_character + 1)}–${number(read.end_character)} / ${number(read.total_characters)}`), next);
+    answer.append(nav);
+  }
+
+  const evidence = node("details", "turn-evidence"); evidence.open = isLatest;
+  const citationCount = (result.citations || []).length;
+  const summary = node("summary");
+  summary.append(node("span", "", "执行详情"), node("small", "", `${citationCount} 条来源 · ${number(result.capacity_report?.model_calls)} 次模型调用`));
+  const body = node("div", "turn-evidence-body");
+  if (!labels.generalChat) body.append(createContextProof(result));
+  body.append(createCitationSection(result, labels.generalChat), createTrace(result));
+  evidence.append(summary, body);
+  article.append(question, answer, evidence);
+  return article;
+}
+
+function renderConversation() {
+  elements.resultContent.replaceChildren(...state.turns.map((turn, index) => renderTurn(turn, index === state.turns.length - 1)));
+  updateConversationState();
+}
+
+function renderResult(result, question) {
+  const turn = {
+    id: (globalThis.crypto?.randomUUID?.() || `turn_${Date.now()}_${Math.random().toString(16).slice(2)}`),
+    question,
+    created_at: new Date().toISOString(),
+    document_name: state.document?.name || null,
+    result: compactResult(result),
+  };
+  state.turns.push(turn);
+  persistConversation();
+  renderConversation();
+  window.requestAnimationFrame(() => elements.resultPanel.scrollTo({ top: elements.resultPanel.scrollHeight, behavior: "smooth" }));
 }
 
 async function runResearch() {
@@ -310,33 +461,30 @@ async function runResearch() {
     const maxWorkers = Number(elements.maxWorkers.value);
     if (!Number.isInteger(defaultAgents) || defaultAgents < 1 || defaultAgents > 32) throw new Error("默认 Agent 数必须在 1至32 之间。");
     if (!Number.isInteger(maxWorkers) || maxWorkers < defaultAgents || maxWorkers > 32) throw new Error("最大 Agent 数必须大于等于默认 Agent 数，且不超过32。");
-    const payload = { mode: state.mode, answer_scope: state.scope, web_search: $("#web-search-toggle").checked, question, history: state.history, default_agents: defaultAgents, max_workers: maxWorkers, reduce_fan_in: Number(elements.reduceFanIn.value) };
+    const payload = { mode: state.mode, answer_scope: state.scope, web_search: $("#web-search-toggle").checked, question, history: modelHistory(), default_agents: defaultAgents, max_workers: maxWorkers, reduce_fan_in: Number(elements.reduceFanIn.value) };
     if (state.mode === "live") {
       const config = apiConfig();
       if (config.base_url && config.api_key && config.model) payload.api = validateApiConfig();
     }
     setLoading(button, true);
     const result = await request("/api/ask", payload);
-    renderResult(result);
-    if (result.execution_mode === "general_chat") {
-      state.history.push({ role: "user", content: question }, { role: "assistant", content: result.answer || "" });
-      state.history = state.history.slice(-20);
-    }
+    renderResult(result, question);
+    elements.question.value = "";
   } catch (error) { toast(error.message, "error"); }
   finally { setLoading(button, false); }
 }
 
-async function readDocumentPage(offset) {
+async function readDocumentPage(offset, question) {
   const button = $("#run-research");
   try {
     setLoading(button, true);
-    renderResult(await request("/api/ask", {
+    const result = await request("/api/ask", {
       mode: state.mode,
-      question: state.lastQuestion || "请输出全文。",
+      question: question || state.lastQuestion || "请输出全文。",
       document_read: true,
       read_offset: Number(offset || 0),
-    }));
-    elements.resultPanel.scrollTo({ top: 0, behavior: "smooth" });
+    });
+    renderResult(result, question || state.lastQuestion || "请输出全文。");
   } catch (error) { toast(error.message, "error"); }
   finally { setLoading(button, false); }
 }
@@ -353,8 +501,22 @@ $("#web-search-toggle").addEventListener("change", (event) => { if (event.curren
 $$('[data-question]').forEach((button) => button.addEventListener("click", () => { elements.question.value = button.dataset.question; elements.question.focus(); }));
 $("#run-research").addEventListener("click", runResearch);
 elements.question.addEventListener("keydown", (event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") runResearch(); });
-$("#copy-answer").addEventListener("click", async () => { try { await navigator.clipboard.writeText(state.answer); toast("答案已复制。"); } catch { toast("浏览器不允许自动复制。", "error"); } });
-$("#read-previous").addEventListener("click", (event) => readDocumentPage(event.currentTarget.dataset.offset));
-$("#read-next").addEventListener("click", (event) => readDocumentPage(event.currentTarget.dataset.offset));
+elements.resultContent.addEventListener("click", async (event) => {
+  const target = event.target.closest("[data-action]");
+  if (!target) return;
+  if (target.dataset.action === "copy-turn") {
+    const turn = state.turns.find((item) => item.id === target.dataset.turnId);
+    try { await navigator.clipboard.writeText(turn?.result?.answer || ""); toast("答案已复制。"); }
+    catch { toast("浏览器不允许自动复制。", "error"); }
+  }
+  if (target.dataset.action === "read-document") await readDocumentPage(target.dataset.offset, target.dataset.question);
+});
+elements.clearConversation.addEventListener("click", () => {
+  if (!state.turns.length || !window.confirm("确定清空当前浏览器中的全部对话记录吗？")) return;
+  state.turns = [];
+  localStorage.removeItem(CONVERSATION_STORAGE_KEY);
+  renderConversation();
+  toast("对话记录已清空。再提问会开始新的会话。");
+});
 
-setMode("live"); setScope("auto"); loadProfiles(); restoreCurrentDocument();
+setMode("live"); setScope("auto"); loadProfiles(); restoreConversation(); restoreCurrentDocument();

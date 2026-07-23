@@ -18,7 +18,9 @@ class WebApplicationTests(unittest.TestCase):
         self.assertNotIn('data-mode="offline"', index_html)
         self.assertIn("流程演示与验收", index_html)
         self.assertIn('id="default-agents"', index_html)
-        self.assertIn('id="result-agent-allocation"', index_html)
+        self.assertIn('id="conversation-history"', index_html)
+        self.assertIn('id="clear-conversation"', index_html)
+        self.assertIn("CONVERSATION_STORAGE_KEY", (WEB_ROOT / "app.js").read_text(encoding="utf-8"))
 
     def test_tester_login_uses_role_session_and_logout(self) -> None:
         auth = AuthManager("tester", "123456", session_ttl=60)
@@ -84,6 +86,26 @@ class WebApplicationTests(unittest.TestCase):
         self.assertEqual(result["answer"], "这是底层 LLM 的直接回答。")
         self.assertEqual(result["context_metrics"]["model_calls"], 1)
         self.assertFalse(result["citations"])
+
+    def test_document_agents_receive_only_bounded_conversation_memory(self) -> None:
+        application = ResearchApplication()
+        application.load_text("employees.md", "# 员工资料\n\n张三属于研发部。\n\n李四属于财务部。")
+        result = application.answer({
+            "mode": "offline",
+            "answer_scope": "document",
+            "question": "这个内容中还有谁？",
+            "history": [
+                {"role": "user", "content": "研发部有哪些员工？"},
+                {"role": "assistant", "content": "目前找到张三。"},
+            ],
+            "default_agents": 3,
+            "max_workers": 3,
+        })
+        memory = result["context_metrics"]["conversation_memory"]
+        self.assertTrue(memory["enabled"])
+        self.assertGreater(memory["characters"], 0)
+        self.assertLessEqual(memory["characters"], 6_000)
+        self.assertTrue(memory["stored_outside_model_window"])
 
     def test_general_chat_can_include_web_sources(self) -> None:
         from long_context_agent.web_search import WebSearchResult

@@ -73,9 +73,17 @@
       <section class="chat-workspace" aria-label="研究对话">
         <header class="workspace-header">
           <div><span class="section-kicker">Supervisor workspace</span><h2>由主 Agent 管理分治任务</h2></div>
-          <div class="workspace-runtime" aria-label="当前运行模式">
-            <span><i aria-hidden="true"></i><strong>智能工作台</strong><small>企业 LLM · 多 Agent</small></span>
-            <a href="/test.html">流程演示与验收 →</a>
+          <div class="workspace-actions">
+            <div class="conversation-tools" aria-label="对话记录">
+              <span id="turn-count">0 轮对话</span>
+              <button id="clear-conversation" class="icon-text-button" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M9 7l1-2h4l1 2m3 0l-1 14H7L6 7"/></svg>清空记录
+              </button>
+            </div>
+            <div class="workspace-runtime" aria-label="当前运行模式">
+              <span><i aria-hidden="true"></i><strong>智能工作台</strong><small>企业 LLM · 多 Agent</small></span>
+              <a href="/test.html">流程演示与验收 →</a>
+            </div>
           </div>
         </header>
 
@@ -89,28 +97,7 @@
             </div>
           </div>
 
-          <div class="result-content" hidden>
-            <div class="message question-message"><span class="message-label">你的问题</span><p id="result-question"></p></div>
-            <div class="message answer-message">
-              <div class="message-head"><span id="answer-mode-label" class="message-label">多 Agent 综合回答</span><div><span id="result-status" class="status-pill success"><i></i>已完成</span><button id="copy-answer" class="icon-text-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8h11v11H8zM5 16H4V5h11v1"/></svg>复制</button></div></div>
-              <div id="answer-content" class="answer-content"></div>
-              <div id="document-read-nav" class="document-read-nav" hidden><button id="read-previous" class="button secondary" type="button">上一段</button><span id="read-progress">—</span><button id="read-next" class="button secondary" type="button">下一段</button></div>
-            </div>
-
-            <section id="context-proof-card" class="context-proof-card" aria-labelledby="context-proof-title">
-              <div class="proof-card-head"><div><span class="section-kicker">Context isolation</span><h3 id="context-proof-title">多 Agent 上下文隔离证明</h3></div><span id="context-proof-state" class="proof-neutral">等待统计</span></div>
-              <div class="context-flow" aria-label="完整资料与模型窗口比较">
-                <div><span>完整资料</span><strong id="result-document-tokens">—</strong></div><svg viewBox="0 0 48 24" aria-hidden="true"><path d="M2 12h42m-7-7l7 7-7 7"/></svg><div><span>最大单次 Prompt</span><strong id="result-prompt-tokens">—</strong></div><svg viewBox="0 0 48 24" aria-hidden="true"><path d="M2 12h42m-7-7l7 7-7 7"/></svg><div><span>64K 模型窗口</span><strong id="result-window-usage">—</strong></div>
-              </div>
-              <div class="proof-meta"><span>自动 Agent <strong id="result-agent-allocation">—</strong></span><span>子任务 <strong id="result-task-count">—</strong></span><span>专业 Agent 隔离 <strong id="result-isolation">—</strong></span><span>主 Agent 接收原文 <strong id="result-supervisor-raw">—</strong></span><span>模型调用 <strong id="result-call-count">—</strong></span></div>
-              <p id="agent-allocation-reason" class="allocation-note"></p>
-            </section>
-
-            <div class="result-grid">
-              <section><div class="result-subheading"><h3>检索来源</h3><span id="citation-count">0 条</span></div><div id="citations" class="citations"></div></section>
-              <details class="trace-details"><summary>查看多 Agent 图执行轨迹</summary><div id="trace" class="trace"></div></details>
-            </div>
-          </div>
+          <div id="conversation-history" class="result-content" hidden></div>
         </div>
 
         <footer class="composer">
