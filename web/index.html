@@ -74,10 +74,14 @@
         <header class="workspace-header">
           <div><span class="section-kicker">Supervisor workspace</span><h2>由主 Agent 管理分治任务</h2></div>
           <div class="workspace-actions">
-            <div class="conversation-tools" aria-label="对话记录">
+            <div class="conversation-tools" aria-label="对话与运行工具">
               <span id="turn-count">0 轮对话</span>
               <button id="clear-conversation" class="icon-text-button" type="button" disabled>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M9 7l1-2h4l1 2m3 0l-1 14H7L6 7"/></svg>清空记录
+              </button>
+              <button id="agent-monitor-toggle" class="agent-monitor-toggle" type="button" aria-controls="agent-monitor" aria-expanded="false" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h5v5H4zM15 4h5v5h-5zM15 15h5v5h-5zM9 9l6-3M9 11l6 6"/></svg>
+                <span><strong>Agent 监控</strong><small id="agent-monitor-summary">暂无运行</small></span>
               </button>
             </div>
             <div class="workspace-runtime" aria-label="当前运行模式">
@@ -86,6 +90,17 @@
             </div>
           </div>
         </header>
+
+        <aside id="agent-monitor" class="agent-monitor-drawer" aria-label="最近一次多 Agent 运行监控" hidden>
+          <header class="agent-monitor-drawer-head">
+            <span><strong>运行监控</strong><small>最近一次多 Agent 任务</small></span>
+            <button id="agent-monitor-close" class="icon-button" type="button" aria-label="关闭 Agent 运行监控">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </header>
+          <p id="agent-monitor-context" class="agent-monitor-context"></p>
+          <div id="agent-monitor-content"></div>
+        </aside>
 
         <div id="result-panel" class="conversation" role="region" aria-label="研究结果，可滚动" aria-live="polite" tabindex="0">
           <div class="result-empty">
