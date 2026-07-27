@@ -51,90 +51,70 @@ Context Atlas 使用另一种协作方式：
 
 ## 工作原理
 
-### 请求路由
+### Agentic Loop 如何运作
 
-系统不会让所有请求都进入多 Agent。路由层先判断任务是否需要模型、工具或协作编排。
-
-```mermaid
-flowchart LR
-    U["用户当前问题"] --> UI["Web UI\n追加保存问答记录"]
-    UI --> R{"执行通道路由\n自动 / 通用 / 文档"}
-    UI --> H["浏览器本地历史\n最多 30 轮"]
-    H --> C["有界记忆构建器\n最近 10 轮 / 最多 20 条消息"]
-
-    R -->|"通用理解、生成或推理"| B["基础 LLM 通道\n对话输入执行 Token 裁剪"]
-    R -->|"原文读取、解析或规则任务"| T["确定性工具通道\n不必调用模型"]
-    R -->|"长文档研究与复杂协作"| M["LangGraph 多 Agent 通道\n确定性外循环"]
-    C --> B
-    C -. "最多 6,000 字符，仅用于消解指代" .-> M
-
-    B --> O["本轮回答、来源与运行指标"]
-    T --> O
-    M --> O
-    O --> UI
-```
-
-浏览器历史、窗口外资料和模型上下文是三个不同边界。界面可以持续保留多轮记录，但只有经过裁剪的有界记忆会进入模型调用；传给文档 Agent 的会话记忆只用于理解指代，不能充当文档证据。
-
-### 多 Agent 长上下文数据流
-
-多 Agent 通道由两个相互分离的部分组成：LangGraph 控制面负责状态和跳转，窗口外数据面负责保存原文、索引、证据与中间产物。
+这里的 Agentic Loop 不是让多个 Agent 自由对话，而是由 LangGraph 控制节点、状态和循环边界。主 Agent 负责管理任务，专业 Agent 只处理自己的分片，Validator 负责决定结果是否满足结束条件。
 
 ```mermaid
 flowchart TB
-    subgraph C["控制面：LangGraph 确定性外循环"]
-        direction TB
-        S["Supervisor\n只接收目标、有界历史和元数据\n不接收完整原文"]
-        A["容量规划与任务表\n计算 Desired / Allocated Agents\n生成连续分片和角色分配"]
-        D["Send 扇出调度\n按任务创建 N 个逻辑 Agent 实例"]
-        W["隔离 Worker 1...N\n角色可重复：事实、分析、风险、比较\n每个实例只处理一个任务和一个分片"]
-        R["Tree Reducer\n固定扇入、逐层合并 Finding\n不读取完整原文"]
-        V["Validator\n程序硬校验 + 模型语义校验"]
-        P["定向重规划\n只保留失败的 task_id"]
-        F["Finalizer\n基于归并结果、证据 ID\n和验证报告形成回答"]
+    INPUT["用户问题 + 有界会话记忆"] --> S["① Supervisor<br/>识别意图、拆分任务<br/>只读取目标和资料元数据"]
+    S --> P["② 容量规划<br/>综合默认数量、Bytes、Chunk 数和任务复杂度<br/>计算本轮 Worker 数 N"]
+    P --> D["③ LangGraph Send<br/>为每个 task_id 创建隔离的 Worker 实例"]
 
-        S --> A --> D --> W
-        W -->|"Finding + Evidence ID"| R
-        R --> V
-        V -->|"通过"| F
-        V -->|"可修复且未达到重试上限"| P
-        P --> D
-        V -->|"不可修复或达到循环边界"| F
-    end
+    D --> W1["Worker 1<br/>role + task + shard + 独立预算"]
+    D --> W2["Worker 2<br/>role + task + shard + 独立预算"]
+    D --> WN["Worker N<br/>按资料规模动态增加"]
 
-    subgraph X["数据面：窗口外记忆"]
-        direction TB
-        SRC["PDF、Word、PPT、文本与网页"]
-        PARSE["解析、父子分块与元数据标准化"]
-        IDX["检索索引\n原文和 Chunk 保留在模型窗口之外"]
-        ART["Artifact Store\nEvidence、Finding、Reduction"]
-        CP["LangGraph Checkpoint\nTask、Finding、Validation、Iteration"]
+    DATA[("窗口外资料层<br/>原文 / Chunk / 检索索引")] -. "仅检索自己的分片<br/>返回有界 Evidence Pack" .-> W1
+    DATA -. "仅检索自己的分片" .-> W2
+    DATA -. "仅检索自己的分片" .-> WN
 
-        SRC --> PARSE --> IDX
-    end
+    W1 --> A["④ Artifact Store<br/>保存 Evidence、Finding 和证据 ID"]
+    W2 --> A
+    WN --> A
+    A --> R["⑤ Tree Reducer<br/>每次最多合并固定数量的 Finding<br/>逐层归并，不重新读取完整原文"]
+    R --> V["⑥ Validator<br/>程序硬校验 + LLM 语义校验"]
+    V --> G{"是否满足结束条件？"}
 
-    IDX -->|"只提供 Bytes / Chunk 元数据"| A
-    IDX -->|"分片内检索并构造有界 Evidence Pack"| W
-    W -->|"写入 Evidence 与 Finding"| ART
-    R -->|"写入分层归并 Artifact"| ART
-    S -. "写入任务表" .-> CP
-    W -. "累积 Finding" .-> CP
-    V -. "记录验证与循环次数" .-> CP
-    F --> OUT["回答 + 引用 + 运行指标 + 执行轨迹"]
+    G -->|"全部通过"| F["⑧ Finalizer<br/>基于归并结果、引用和验证报告生成回答"]
+    G -->|"有可修复任务<br/>且未达到重试上限"| RP["⑦ Supervisor Replan<br/>只保留失败的 task_id"]
+    RP -->|"进入下一轮"| D
+    G -->|"不可修复或达到循环上限"| F
 
-    G["统一上下文预算门\n每次 LLM 调用独立检查\n输入 + 输出预留 + 安全余量 ≤ 64K"]
-    G -. "约束" .-> S
-    G -. "约束" .-> W
-    G -. "约束" .-> R
-    G -. "约束" .-> V
-    G -. "约束" .-> F
+    F --> OUTPUT["最终回答 + 引用 + 未解决缺口<br/>运行指标 + Agent 执行轨迹"]
 ```
 
-图中实线表示任务执行或证据流，虚线表示状态记录和预算约束。Artifact Store 与 LangGraph Checkpoint 都位于模型窗口之外：前者保存可引用内容，后者保存确定性流程状态。
+一次循环从 `Send` 开始，到 Validator 作出判定结束。Validator 通过时进入 Finalizer；验证失败时，只有存在可修复任务且尚未达到 `max_replans`，LangGraph 才把失败的 `task_id` 送回调度节点。已经通过的任务不会重复执行，原文也不会在 Agent 之间传递。
 
-图中的 `N` 是运行时根据默认下限、资料字节数、Chunk 数量、任务复杂度和最大 Worker 限制计算出的实际 Agent 数，不代表四个固定 Agent。事实、分析、风险和比较只是任务路由角色；同一角色可以同时创建多个相互隔离的实例。
+| 循环要素 | 系统中的具体含义 |
+|---|---|
+| 循环状态 | Task、Finding、Reduction、Validation、Iteration 和 Artifact 引用 |
+| 循环动作 | 规划 → 并行执行 → 树形归并 → 验证 |
+| 反馈信号 | Validator 返回的失败原因与可重试 `task_id` |
+| 重试范围 | 仅重新调度失败任务，不重跑全部 Worker |
+| 结束条件 | 验证通过、没有可重试任务，或达到最大重规划次数 |
+| 确定性边界 | 跳转和循环次数由 LangGraph 条件控制，LLM 不能自行改变流程 |
 
-完整原文只存在于窗口外数据面。Supervisor 只维护任务和状态；Worker 在自己的分片内检索并构造有界 Evidence Pack；Reducer 只合并结构化 Finding；Validator 失败时只把可修复的任务 ID 送回调度节点。因此，资料总量和 Agent 数量可以增长，而任意一次模型调用仍受独立的 64K 预算约束。
+### 为什么可以处理超过 64K 的资料
+
+系统没有修改底层模型的 64K 上限，而是把“大资料一次输入”改成“多次有界调用”。资料总量可以超过 64K，但任何单次 LLM 请求仍必须处于模型窗口以内。
+
+```mermaid
+flowchart LR
+    DOC["完整资料<br/>总量可以超过 64K"] --> CHUNK["解析与分块<br/>保存在模型窗口之外"]
+    CHUNK --> SHARD["按 Bytes / Chunk 划分为 N 个分片"]
+    SHARD --> PACK["每个 Worker 只接收<br/>一个有界 Evidence Pack"]
+    PACK --> WORKER["Worker LLM 调用"]
+    WORKER --> FINDING["输出短小的结构化 Finding<br/>正文替换为 Evidence ID"]
+    FINDING --> REDUCE["Reducer LLM 调用<br/>固定扇入、逐层归并少量 Finding"]
+    REDUCE --> FINAL["Finalizer LLM 调用<br/>只读取归并结果与验证报告"]
+
+    LIMIT["统一预算门<br/>输入 Token + 输出预留 + 安全余量 ≤ 64K"] -. "调用前检查" .-> WORKER
+    LIMIT -.-> REDUCE
+    LIMIT -.-> FINAL
+```
+
+关键点是将上下文按职责分散，而不是把多个 Agent 的内容重新拼回同一个大 Prompt。Supervisor 不读取完整原文，Worker 不共享彼此历史，Reducer 不读取完整资料，Finalizer 不接收所有分片正文；原文、Artifact 和 LangGraph Checkpoint 始终位于模型窗口之外。图中的统一预算门同样应用于 Supervisor 和 Validator 等其他模型节点。
 
 ### 三条执行通道
 
