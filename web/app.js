@@ -3,12 +3,6 @@
 const CONVERSATION_STORAGE_KEY = "context-atlas-conversation-v1";
 const MAX_STORED_TURNS = 30;
 const MAX_STORED_CHARACTERS = 2_500_000;
-const AGENT_ROLE_LABELS = {
-  fact_extractor: "事实提取",
-  analyst: "综合分析",
-  risk_reviewer: "风险审查",
-  comparator: "对比分析",
-};
 const state = { mode: "live", scope: "auto", document: null, profiles: [], lastQuestion: "", turns: [] };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -97,7 +91,12 @@ function compactResult(result) {
     tasks: (result.tasks || []).slice(0, 32).map((task) => ({
       task_id: task.task_id,
       agent_instance_id: task.agent_instance_id,
-      agent_type: task.agent_type,
+      agent_name: task.agent_name,
+      agent_instruction: task.agent_instruction,
+      objective: task.objective,
+      capabilities: task.capabilities || [],
+      tools: task.tools || [],
+      source_policy: task.source_policy || "none",
       shard_index: task.shard_index,
       shard_count: task.shard_count,
       shard_bytes: task.shard_bytes,
@@ -164,10 +163,10 @@ function renderDocument(info, announce = true) {
   verdict.lastChild.textContent = info.exceeds_shard_byte_limit
     ? `索引文本 ${bytes(info.indexed_bytes)} 超过 ${bytes(info.shard_byte_limit)}，回答时将自动分片并分配多个 Agent`
     : (info.exceeds_64k_tokens
-      ? `资料约 ${number(info.estimated_tokens)} Token，将由多个隔离 Agent 分担`
-      : "资料规模较小，仍会启用默认数量的隔离 Agent");
+      ? `资料约 ${number(info.estimated_tokens)} Token，可由动态 Agent 分片处理`
+      : "资料规模较小，可作为动态 Agent 的可选上下文");
   $("#empty-title").textContent = "资料已就绪，可以开始提问";
-  $("#empty-copy").textContent = `${info.name} 已建立 ${number(info.chunks)} 个证据块；自动模式会优先使用文档 Agent。`;
+  $("#empty-copy").textContent = `${info.name} 已建立 ${number(info.chunks)} 个资料块；Supervisor 会按问题决定哪些 Agent 需要使用它。`;
   updateComposerHint();
   if (announce) toast(`已解析 ${info.name}，建立 ${info.chunks} 个可检索证据块。`);
 }
@@ -281,9 +280,10 @@ function setScope(scope) {
     button.setAttribute("aria-pressed", String(active));
   });
   const placeholders = {
-    auto: "直接提问，或上传文档后针对资料提问…",
-    general: "像普通智能体一样提问、写作、解释或编程…",
-    document: "针对已上传文档提问，可直接指定页码…",
+    auto: "直接提问；系统会判断使用单模型还是动态多 Agent…",
+    general: "使用底层 LLM 直接回答、写作、解释或编程…",
+    agent: "描述目标，Supervisor 将即时生成并调度所需 Agent…",
+    document: "针对已上传资料提问，可直接指定页码…",
   };
   elements.question.placeholder = placeholders[scope] || placeholders.auto;
   updateComposerHint();
@@ -293,9 +293,10 @@ function updateComposerHint() {
   const webEnabled = Boolean($("#web-search-toggle")?.checked);
   const modeText = "智能回答";
   let routeText;
-  if (state.scope === "general") routeText = "直接使用 LLM 通用能力";
-  else if (state.scope === "document") routeText = state.document ? "仅基于当前文档调度 Agent" : "需要先上传文档";
-  else routeText = state.document ? "自动优先文档问答，普通聊天直连 LLM" : "自动使用通用问答";
+  if (state.scope === "general") routeText = "单模型直接回答";
+  else if (state.scope === "agent") routeText = state.document ? "动态生成 Agent；资料作为可选工具" : "动态生成 Agent；使用模型通用能力";
+  else if (state.scope === "document") routeText = state.document ? "动态 Agent 受当前资料约束" : "需要先上传资料";
+  else routeText = state.document ? "自动选择执行方式；资料仅在需要时使用" : "普通聊天直答，其他问题动态生成 Agent";
   const webText = webEnabled ? " · 联网检索已开启（最多 5 个来源）" : "";
   elements.modeHint.textContent = `${modeText} · ${routeText}${webText}`;
   const webState = $("#web-search-state");
@@ -309,7 +310,7 @@ function resultLabels(result) {
   return {
     documentRead,
     generalChat,
-    mode: documentRead ? "PDF / 文档原文" : (generalChat ? "LLM 直接回答" : (offlineDemo ? "流程演示结果" : "多 Agent 智能回答")),
+    mode: documentRead ? "PDF / 文档原文" : (generalChat ? "LLM 直接回答" : (offlineDemo ? "流程演示结果" : "动态多 Agent 回答")),
     status: documentRead ? "原文直接读取" : (generalChat ? "直接回答" : (offlineDemo ? "测试模型" : (result.validation?.approved ? "Validator 通过" : "Validator 拒绝"))),
   };
 }
@@ -319,7 +320,7 @@ function createContextProof(result) {
   const card = node("section", "context-proof-card");
   const head = node("div", "proof-card-head");
   const title = node("div");
-  title.append(node("span", "section-kicker", "Context isolation"), node("h3", "", "多 Agent 上下文隔离证明"));
+  title.append(node("span", "section-kicker", "Context isolation"), node("h3", "", "动态 Agent 上下文隔离证明"));
   const proof = node("span", "proof-neutral", "等待统计");
   if (result.document_read) {
     proof.className = "proof-pass";
@@ -358,7 +359,7 @@ function createContextProof(result) {
   [
     ["自动 Agent", `${number(report.default_agents)} → ${number(report.allocated_agents)} 个`],
     ["子任务", `${number(report.task_count)} 个`],
-    ["专业 Agent 隔离", report.isolated_specialist_contexts ? "是" : "否"],
+    ["动态 Worker 隔离", report.isolated_worker_contexts ? "是" : "否"],
     ["主 Agent 接收原文", report.supervisor_received_raw_document ? "是" : "否"],
     ["模型调用", `${number(report.model_calls)} 次`],
   ].forEach(([label, value]) => { const item = node("span", "", `${label} `); item.append(node("strong", "", value)); meta.append(item); });
@@ -411,20 +412,29 @@ function createAgentVisualization(result) {
 
   const agentStage = node("div", "agent-stage");
   const agentStageHead = node("div", "agent-stage-head");
-  agentStageHead.append(node("span", "pipeline-node-index", "02"), node("strong", "", "专业 Agent 分片执行"), node("small", "", `${number(report.source_indexed_bytes)} Bytes 索引资料`));
+  const sourceSummary = Number(report.source_indexed_bytes || 0) > 0
+    ? `${number(report.source_indexed_bytes)} Bytes 外部资料按需使用`
+    : "不依赖外部资料，保留模型通用能力";
+  agentStageHead.append(node("span", "pipeline-node-index", "02"), node("strong", "", "运行时生成的 Agent"), node("small", "", sourceSummary));
   const grid = node("div", "agent-grid");
   tasks.forEach((task, index) => {
-    const role = String(task.agent_type || "unknown");
-    const roleClass = Object.hasOwn(AGENT_ROLE_LABELS, role) ? role.replace("_extractor", "").replace("_reviewer", "") : "unknown";
-    const card = node("article", `agent-mini-card role-${roleClass}`);
+    const card = node("article", "agent-mini-card dynamic-agent-card");
     const cardHead = node("div");
-    cardHead.append(node("span", "agent-number", `Agent ${String(index + 1).padStart(2, "0")}`), node("span", "agent-role", AGENT_ROLE_LABELS[role] || role));
+    cardHead.append(node("span", "agent-number", `Agent ${String(index + 1).padStart(2, "0")}`), node("span", "agent-role", task.agent_name || "动态任务 Agent"));
     const shardIndex = Number(task.shard_index || index + 1);
     const shardCount = Number(task.shard_count || tasks.length);
+    const sourceLine = Number(task.shard_chunks || 0) > 0
+      ? `分片 ${number(shardIndex)} / ${number(shardCount)} · ${bytes(Number(task.shard_bytes || 0))} · ${number(task.shard_chunks)} 个资料块 · 独立 64K 窗口 / 安全输入 ${number(task.input_budget)} Token`
+      : `独立 64K 窗口 · 最大安全输入 ${number(task.input_budget)} Token`;
+    const tools = (task.tools || []).join(" · ") || "model_reasoning";
+    const capabilities = (task.capabilities || []).join(" · ") || "通用推理";
     card.append(
       cardHead,
-      node("strong", "agent-shard", `分片 ${number(shardIndex)} / ${number(shardCount)}`),
-      node("p", "", `${bytes(Number(task.shard_bytes || 0))} · ${number(task.shard_chunks)} 个 Chunk`),
+      node("strong", "agent-shard", task.objective || "独立完成当前子任务"),
+      node("p", "agent-instruction", task.agent_instruction || "根据当前问题独立完成任务。"),
+      node("p", "", sourceLine),
+      node("small", "agent-tools", `能力：${capabilities}`),
+      node("small", "agent-tools", `工具：${tools}`),
       node("span", "agent-complete", "已完成"),
     );
     grid.append(card);
@@ -440,7 +450,8 @@ function createAgentVisualization(result) {
   pipeline.append(supervisor, firstArrow, agentStage, secondArrow, finish);
 
   section.append(head, metrics, capacity, pipeline);
-  if (report.agent_allocation_reason) section.append(node("p", "allocation-reason", `分配依据：${report.agent_allocation_reason}`));
+  if (report.agent_strategy) section.append(node("p", "allocation-reason", `生成策略：${report.agent_strategy}`));
+  if (report.agent_allocation_reason) section.append(node("p", "allocation-reason", `数量依据：${report.agent_allocation_reason}`));
   if (capped) section.append(node("p", "allocation-warning", `系统计算需要 ${number(desired)} 个 Agent，但配置上限为 ${number(maximum)}；建议提高最大 Agent 数或缩小单次任务范围。`));
   return section;
 }
@@ -482,7 +493,7 @@ function createSourceDisclosure(result, generalChat) {
   const identity = node("span", "source-disclosure-title");
   identity.append(icon("M4 6.5h16M4 12h16M4 17.5h10"));
   const labels = node("span");
-  labels.append(node("strong", "", "检索来源"), node("small", "", "展开查看文件、字节大小与证据摘要"));
+  labels.append(node("strong", "", "外部来源"), node("small", "", "展开查看 Agent 实际使用的资料与工具结果"));
   identity.append(labels);
   summary.append(identity, node("span", "source-count-badge", `${number(citations.length)} 条`));
   const body = node("div", "source-disclosure-body");
@@ -493,7 +504,7 @@ function createSourceDisclosure(result, generalChat) {
 
 function createTrace(result) {
   const details = node("details", "trace-details");
-  details.append(node("summary", "", "查看多 Agent 图执行轨迹"));
+  details.append(node("summary", "", "查看 Agent Loop 执行轨迹"));
   const trace = node("div", "trace");
   (result.trace || []).forEach((step, index) => {
     const item = node("div", "trace-step"); item.dataset.step = String(index + 1);

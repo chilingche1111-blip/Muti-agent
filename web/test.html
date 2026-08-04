@@ -36,13 +36,13 @@
           </div>
         </section>
 
-        <div class="workflow-strip" aria-label="固定执行流程"><span>确定性外循环</span><i></i><span>Supervisor</span><i></i><span>专业 Agent</span><i></i><span>Reducer</span><i></i><span>Validator</span></div>
+        <div class="workflow-strip" aria-label="固定执行流程"><span>确定性外循环</span><i></i><span>Supervisor</span><i></i><span>动态 Agent</span><i></i><span>Reducer</span><i></i><span>Validator</span></div>
 
         <div class="control-grid-v2">
           <section class="dashboard-card run-card-v2">
             <div class="card-heading"><div><span class="section-kicker">运行设置</span><h2>基准任务</h2></div><span id="test-document-status" class="status-pill neutral"><i></i>加载中</span></div>
             <div class="corpus-line"><div><span>测试资料</span><strong>enterprise_research_128k.md</strong></div><div><span>大小</span><strong id="test-bytes">—</strong></div><div><span>块 / 章节</span><strong id="test-chunks">—</strong></div><div><span>预计 Token</span><strong id="test-document-tokens">—</strong></div></div>
-            <div class="benchmark-config"><div class="field"><label for="benchmark-workers">最大专业 Agent</label><input id="benchmark-workers" type="number" min="1" max="32" value="8" /></div><div class="field"><label for="benchmark-fan-in">Reducer 扇入</label><input id="benchmark-fan-in" type="number" min="2" max="8" value="4" /></div><div class="field"><label for="benchmark-replans">最大重规划</label><input id="benchmark-replans" type="number" min="0" max="3" value="1" /></div></div>
+            <div class="benchmark-config"><div class="field"><label for="benchmark-workers">最大动态 Agent</label><input id="benchmark-workers" type="number" min="1" max="32" value="8" /></div><div class="field"><label for="benchmark-fan-in">Reducer 扇入</label><input id="benchmark-fan-in" type="number" min="2" max="8" value="4" /></div><div class="field"><label for="benchmark-replans">最大重规划</label><input id="benchmark-replans" type="number" min="0" max="3" value="1" /></div></div>
             <div class="run-controls"><div class="mode-switch" role="group" aria-label="测试模式"><button type="button" data-test-mode="offline" class="active">离线验证</button><button type="button" data-test-mode="live">真实 API</button></div><span id="run-meta" class="run-meta">尚未运行</span><button id="run-benchmark" class="button primary" type="button">开始验收</button></div>
           </section>
 

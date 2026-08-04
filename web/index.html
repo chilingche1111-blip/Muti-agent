@@ -66,7 +66,7 @@
 
         <div class="sidebar-footnote">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a10 10 0 100-20 10 10 0 000 20zm0-11v6m0-10h.01"/></svg>
-          <span>模型窗口仍为 64K；确定性外循环通过统一调度、专业 Agent 隔离、分层归并和 Validator 控制上下文。</span>
+          <span>模型窗口仍为 64K；Supervisor 按问题即时生成 Agent，外部资料只在任务需要时进入有界上下文。</span>
         </div>
       </aside>
 
@@ -106,9 +106,9 @@
           <div class="result-empty">
             <div class="empty-visual" aria-hidden="true"><span></span><span></span><span></span></div>
             <strong id="empty-title">开始一次智能问答</strong>
-            <p id="empty-copy">可直接使用通用 LLM，也可以上传文档后启用多 Agent 分治与联网检索。</p>
+            <p id="empty-copy">可以直接使用底层 LLM，也可以让 Supervisor 根据问题即时生成并调度多个 Agent；文档与网络只是可选工具。</p>
             <div class="method-steps" aria-label="处理方法">
-              <span><b>01</b> 通用回答</span><i></i><span><b>02</b> 文档分治</span><i></i><span><b>03</b> 联网检索</span>
+              <span><b>01</b> 分析问题</span><i></i><span><b>02</b> 生成 Agent</span><i></i><span><b>03</b> 验证汇总</span>
             </div>
           </div>
 
@@ -121,8 +121,8 @@
               <span class="control-label">回答范围</span>
               <div class="scope-switch" role="group" aria-label="回答范围">
                 <button type="button" data-scope="auto" class="active" aria-pressed="true">自动</button>
-                <button type="button" data-scope="general" aria-pressed="false">通用</button>
-                <button type="button" data-scope="document" aria-pressed="false">文档</button>
+                <button type="button" data-scope="general" aria-pressed="false">单模型</button>
+                <button type="button" data-scope="agent" aria-pressed="false">多 Agent</button>
               </div>
             </div>
             <label class="web-toggle" title="搜索公开网页并把来源交给模型">
@@ -146,7 +146,7 @@
           </div>
           <div class="composer-footer">
             <p id="mode-hint">智能回答 · 自动判断通用问答或文档 Agent。</p>
-            <details class="advanced-settings"><summary>运行参数</summary><div class="advanced-popover"><div class="field"><label for="default-agents">默认 Agent 数</label><input id="default-agents" type="number" min="1" max="32" value="3" /></div><div class="field"><label for="max-workers">最大 Agent 数</label><input id="max-workers" type="number" min="1" max="32" value="16" /></div><div class="field"><label for="reduce-fan-in">Reducer 扇入</label><input id="reduce-fan-in" type="number" min="2" max="8" value="4" /></div><p class="parameter-note">系统按任务规模自动分配，单一来源索引文本超过 64 KB 时自动分片。</p></div></details>
+            <details class="advanced-settings"><summary>运行参数</summary><div class="advanced-popover"><div class="field"><label for="default-agents">默认 Agent 数</label><input id="default-agents" type="number" min="1" max="32" value="3" /></div><div class="field"><label for="max-workers">最大 Agent 数</label><input id="max-workers" type="number" min="1" max="32" value="16" /></div><div class="field"><label for="reduce-fan-in">Reducer 扇入</label><input id="reduce-fan-in" type="number" min="2" max="8" value="4" /></div><p class="parameter-note">Agent 的职责和工具由问题动态决定；数量由任务复杂度、输入规模和配置上限共同决定。</p></div></details>
           </div>
         </footer>
       </section>

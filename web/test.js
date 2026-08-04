@@ -5,15 +5,11 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 const number = (value) => new Intl.NumberFormat("zh-CN").format(Number(value) || 0);
 const roleNames = {
   supervisor: "Supervisor",
-  fact_extractor: "事实抽取 Agent",
-  analyst: "分析 Agent",
-  risk_reviewer: "风险审查 Agent",
-  comparator: "对比 Agent",
-  reducer: "Reducer",
+  worker: "动态 Agent",
+  reducer: "Tree Reducer",
   validator: "Validator",
   finalizer: "Finalizer",
 };
-
 let mode = "offline";
 let latestReport = null;
 let verifiedApi = null;
@@ -111,7 +107,7 @@ function benchmarkConfig() {
     reduce_fan_in: Number($("#benchmark-fan-in").value),
     max_replans: Number($("#benchmark-replans").value),
   };
-  if (!Number.isInteger(config.max_workers) || config.max_workers < 1 || config.max_workers > 32) throw new Error("最大专业 Agent 必须在 1至32 之间。");
+  if (!Number.isInteger(config.max_workers) || config.max_workers < 1 || config.max_workers > 32) throw new Error("最大动态 Agent 必须在 1至32 之间。");
   if (!Number.isInteger(config.reduce_fan_in) || config.reduce_fan_in < 2 || config.reduce_fan_in > 8) throw new Error("Reducer 扇入必须在 2至8 之间。");
   if (!Number.isInteger(config.max_replans) || config.max_replans < 0 || config.max_replans > 3) throw new Error("最大重规划必须在 0至3 之间。");
   return config;
@@ -261,11 +257,12 @@ function renderInspector(index) {
   }
 
   const taskSection = node("section", "audit-section");
-  taskSection.append(node("h3", "", "主 Agent 任务路由"));
+  taskSection.append(node("h3", "", "Supervisor 动态生成的 Agent"));
   const taskGrid = node("div", "task-grid");
   result.tasks.forEach((task) => {
     const item = node("article");
-    item.append(node("span", "task-id", task.task_id), node("strong", "", task.objective), node("small", "", `${roleNames[task.agent_type] || task.agent_type} · 优先级 ${task.priority} · 预算 ${number(task.input_budget)} Token`));
+    const tools = (task.tools || []).join(" / ") || "model_reasoning";
+    item.append(node("span", "task-id", task.task_id), node("strong", "", task.agent_name || "动态任务 Agent"), node("p", "", task.objective), node("small", "", `${tools} · 优先级 ${task.priority} · 独立64K窗口 / 安全输入 ${number(task.input_budget)} Token`));
     taskGrid.append(item);
   });
   taskSection.append(taskGrid);
@@ -421,7 +418,7 @@ $("#run-benchmark").addEventListener("click", async () => {
   const button = $("#run-benchmark");
   try {
     setLoading(button, true);
-    $("#run-meta").textContent = "正在执行 Supervisor → Specialists → Validator…";
+    $("#run-meta").textContent = "正在执行 Supervisor → Dynamic Workers → Validator…";
     $("#verdict-eyebrow").textContent = "验收运行中";
     $("#verdict-title").textContent = "正在收集可审计证据";
     const payload = { mode, ...benchmarkConfig() };
