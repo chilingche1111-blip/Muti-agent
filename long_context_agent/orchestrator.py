@@ -28,6 +28,15 @@ TARGET_SOURCE_TOKENS_PER_AGENT = 45_000
 EXHAUSTIVE_SCAN_TERMS = ("全部", "所有", "完整清单", "逐条", "逐项", "员工信息", "员工名单")
 SOURCE_POLICIES = {"none", "optional", "required"}
 BUILTIN_TOOLS = {"model_reasoning", "source_search", "web_sources"}
+OUTPUT_MODES = {"finding", "artifact"}
+FULL_DELIVERABLE_TERMS = (
+    "完整", "全文", "全部正文", "整个", "原文", "成稿", "最终稿", "逐章", "逐节",
+    "不要概括", "不要总结", "而不是概括", "直接输出",
+)
+DELIVERABLE_TYPES = (
+    "小说", "故事", "剧本", "报告", "文章", "论文", "方案", "计划书", "说明书",
+    "教程", "合同", "文案", "代码", "脚本", "邮件", "演讲稿",
+)
 
 
 class ChatModel(Protocol):
@@ -55,6 +64,7 @@ class GraphState(TypedDict, total=False):
     intent: str
     agent_allocation: dict[str, Any]
     dependency_phase: int
+    delivery_contract: dict[str, Any]
 
 
 class DynamicWorkerState(TypedDict):
@@ -102,20 +112,29 @@ class MultiAgentResearchSystem:
         shard_byte_limit: int = SOURCE_SHARD_BYTE_LIMIT,
         reduce_fan_in: int = 4,
         max_replans: int = 1,
+        parallel_workers: int = 4,
+        max_artifact_output_tokens: int = 12_000,
+        target_artifact_characters: int = 1_200,
         available_tools: set[str] | None = None,
     ) -> None:
         if context_limit < 8_000:
             raise ValueError("模型上下文上限不能低于 8,000 Token")
-        if max_workers < 1 or max_workers > 32:
-            raise ValueError("专业子 Agent 数量必须在 1至32 之间")
-        if default_agents < 1 or default_agents > 32:
-            raise ValueError("默认动态 Agent 数量必须在 1至32 之间")
+        if max_workers < 1 or max_workers > 128:
+            raise ValueError("动态子 Agent 数量必须在 1至128 之间")
+        if default_agents < 1 or default_agents > 128:
+            raise ValueError("默认动态 Agent 数量必须在 1至128 之间")
         if shard_byte_limit < 16 * 1024 or shard_byte_limit > 4 * 1024 * 1024:
             raise ValueError("单 Agent 分片阈值必须在 16 KB至4 MB 之间")
         if reduce_fan_in < 2 or reduce_fan_in > 8:
             raise ValueError("Reducer 扇入必须在 2至8 之间")
         if max_replans < 0 or max_replans > 3:
             raise ValueError("确定性外循环重规划次数必须在 0至3 之间")
+        if parallel_workers < 1 or parallel_workers > 16:
+            raise ValueError("并行模型请求数必须在 1至16 之间")
+        if max_artifact_output_tokens < 2_000 or max_artifact_output_tokens > 24_000:
+            raise ValueError("单 Agent 产物输出上限必须在 2,000至24,000 Token 之间")
+        if target_artifact_characters < 400 or target_artifact_characters > 8_000:
+            raise ValueError("目标分段长度必须在 400至8,000 字符之间")
         self.model = model
         self.index = index
         self.artifacts = artifact_store or ArtifactStore()
@@ -125,6 +144,9 @@ class MultiAgentResearchSystem:
         self.shard_byte_limit = shard_byte_limit
         self.reduce_fan_in = reduce_fan_in
         self.max_replans = max_replans
+        self.parallel_workers = parallel_workers
+        self.max_artifact_output_tokens = max_artifact_output_tokens
+        self.target_artifact_characters = target_artifact_characters
         inferred_tools = {"model_reasoning"}
         if self.index.chunks:
             inferred_tools.add("source_search")
@@ -144,6 +166,7 @@ class MultiAgentResearchSystem:
         self._allocation: dict[str, Any] = {}
         self._agent_strategy = ""
         self._conversation_context = ""
+        self._delivery_contract: dict[str, Any] = {"response_mode": "synthesis"}
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -189,10 +212,19 @@ class MultiAgentResearchSystem:
         self._allocation = {}
         self._agent_strategy = ""
         self._conversation_context = str(conversation_context).strip()[:6_000]
+        self._delivery_contract = self._infer_delivery_contract(
+            question.strip(), self._conversation_context
+        )
         self.artifacts.clear()
         state = self._graph.invoke(
-            {"question": question.strip(), "findings": [], "trace": [], "iteration": 0},
-            config={"configurable": {"thread_id": uuid.uuid4().hex}},
+            {
+                "question": question.strip(), "findings": [], "trace": [], "iteration": 0,
+                "delivery_contract": dict(self._delivery_contract),
+            },
+            config={
+                "configurable": {"thread_id": uuid.uuid4().hex},
+                "max_concurrency": self.parallel_workers,
+            },
         )
         findings = self._deduplicate_findings(state.get("findings", []))
         evidence_ids = list(dict.fromkeys(
@@ -237,10 +269,19 @@ class MultiAgentResearchSystem:
                     "或结论必须由外部资料支持。"
                     "任务存在先后依赖时，depends_on 只能引用排在当前任务之前的 task_XX；"
                     "没有依赖时返回空数组。创作类任务应先生成总纲，再并行生成章节，最后执行一致性检查。"
+                    "同时判断用户最终需要的是综合回答还是完整产物。需要交付小说、报告、代码等完整内容时，"
+                    "response_mode 必须为 full_artifact，正文任务的 output_mode 必须为 artifact；"
+                    "要求总结、解释、比较、分析、问答时使用 synthesis/finding。不能只按内容名词判断："
+                    "例如‘分析这部小说’应综合回答，‘写出整部小说’才交付完整产物；"
+                    "‘总结报告’应摘要，‘撰写可直接提交的报告’应交付全文。"
                     "返回JSON：{\"problem_type\":...,\"strategy\":...,\"tasks\":[{"
                     "\"objective\":...,\"query\":...,\"agent_name\":...,"
                     "\"agent_instruction\":...,\"capabilities\":[...],\"tools\":[...],"
-                    "\"source_policy\":...,\"priority\":1到100,\"depends_on\":[\"task_01\"]}]}。"
+                    "\"source_policy\":...,\"priority\":1到100,\"depends_on\":[\"task_01\"],"
+                    "\"output_mode\":\"finding|artifact\",\"include_in_final\":true/false,"
+                    "\"sequence\":0,\"target_characters\":0,\"artifact_label\":...}],"
+                    "\"delivery\":{\"response_mode\":\"synthesis|full_artifact\","
+                    "\"artifact_type\":...,\"target_characters\":0,\"target_parts\":0}}。"
                     f"最多{self.max_workers}项。"
                 ),
             },
@@ -250,6 +291,7 @@ class MultiAgentResearchSystem:
                     f"可用工具：{json.dumps(sorted(self.available_tools), ensure_ascii=False)}\n"
                     f"资料元数据：{json.dumps(source_stats, ensure_ascii=False)}\n"
                     f"默认并行下限：{self.default_agents}\n"
+                    f"程序识别的交付约束：{json.dumps(self._delivery_contract, ensure_ascii=False)}\n"
                     + (
                         f"有界对话记忆（仅用于理解指代）：\n{self._conversation_context}\n"
                         if self._conversation_context else ""
@@ -261,7 +303,11 @@ class MultiAgentResearchSystem:
         parsed, _ = self._call_json(
             "supervisor", messages, max_tokens=2_000, required_keys=("tasks",)
         )
+        self._delivery_contract = self._resolve_delivery_contract(
+            self._delivery_contract, parsed.get("delivery")
+        )
         tasks = self._normalize_tasks(parsed.get("tasks"), question)
+        tasks = self._apply_delivery_contract(tasks, question)
         planning_source = "dynamic_model_supervisor"
         intent = str(parsed.get("problem_type") or "general_problem")[:120]
         strategy = str(parsed.get("strategy") or "动态生成执行 Agent 并按子任务并行求解")[:500]
@@ -281,6 +327,7 @@ class MultiAgentResearchSystem:
             "planning_source": planning_source,
             "intent": intent,
             "agent_allocation": dict(self._allocation),
+            "delivery_contract": dict(self._delivery_contract),
             "trace": [{
                 "node": "supervisor",
                 "role": "主 Agent",
@@ -295,6 +342,259 @@ class MultiAgentResearchSystem:
                 "generated_agents": generated_names,
             }],
         }
+
+    def _infer_delivery_contract(self, question: str, conversation_context: str) -> dict[str, Any]:
+        """Infer the response shape without hard-coding a novel-only workflow.
+
+        The model may refine the plan, but explicit user requests for a complete
+        deliverable are a deterministic contract and cannot be downgraded to a summary.
+        """
+        current = re.sub(r"\s+", "", question)
+        prior = re.sub(r"\s+", "", conversation_context)
+        combined = f"{current}\n{prior}"
+        artifact_type = next((item for item in DELIVERABLE_TYPES if item in current), "")
+        if not artifact_type and any(term in current for term in ("这个", "整个", "全文", "完整", "成稿")):
+            artifact_type = next((item for item in DELIVERABLE_TYPES if item in prior), "")
+
+        target_characters = self._parse_character_target(current)
+        if not target_characters and artifact_type and any(
+            term in current for term in ("这个", "整个", "继续", "全文", "完整", "成稿", "输出")
+        ):
+            target_characters = self._parse_character_target(prior)
+        target_parts = self._parse_part_target(current, artifact_type)
+        if not target_parts and artifact_type and any(
+            term in current for term in ("这个", "整个", "继续", "全文", "完整", "成稿", "输出")
+        ):
+            target_parts = self._parse_part_target(prior, artifact_type)
+
+        full_requested = bool(
+            artifact_type
+            and (
+                target_characters
+                or target_parts
+                or any(term in current for term in FULL_DELIVERABLE_TERMS)
+                or re.search(r"(?:写|生成|创作|输出|制作|撰写).{0,12}" + re.escape(artifact_type), current)
+            )
+        )
+        summary_requested = any(term in current for term in ("总结", "概括", "摘要")) and not any(
+            term in current for term in ("不要总结", "不要概括", "不是概括", "而不是概括")
+        )
+        if summary_requested and not target_characters and not target_parts:
+            full_requested = False
+
+        if full_requested and not target_parts:
+            if target_characters:
+                target_parts = max(
+                    self.default_agents - 1,
+                    math.ceil(target_characters / self.target_artifact_characters),
+                )
+            else:
+                target_parts = max(1, self.default_agents - 1)
+        if full_requested:
+            reserved_control_agents = 2 if self.max_workers >= 3 else max(0, self.max_workers - 1)
+            target_parts = max(1, min(target_parts, max(1, self.max_workers - reserved_control_agents)))
+
+        return {
+            "response_mode": "full_artifact" if full_requested else "synthesis",
+            "artifact_type": artifact_type or "通用内容",
+            "target_characters": max(0, target_characters),
+            "target_parts": max(0, target_parts),
+            "assembly": "ordered_lossless" if full_requested else "model_synthesis",
+            "summary_may_replace_deliverable": False if full_requested else True,
+            "user_preference": (
+                "full_artifact" if full_requested else "synthesis" if summary_requested else "auto"
+            ),
+            "decision_source": (
+                "explicit_user_full" if full_requested else "explicit_user_summary" if summary_requested
+                else "pending_supervisor"
+            ),
+        }
+
+    def _resolve_delivery_contract(
+        self,
+        inferred: dict[str, Any],
+        model_delivery: Any,
+    ) -> dict[str, Any]:
+        """Resolve response shape with explicit user intent above Supervisor judgment."""
+        contract = dict(inferred)
+        preference = str(contract.get("user_preference", "auto"))
+        if preference in {"full_artifact", "synthesis"}:
+            return contract
+
+        proposed = model_delivery if isinstance(model_delivery, dict) else {}
+        proposed_mode = str(proposed.get("response_mode", "synthesis")).strip().casefold()
+        if proposed_mode not in {"synthesis", "full_artifact"}:
+            proposed_mode = "synthesis"
+        contract["response_mode"] = proposed_mode
+        contract["decision_source"] = "dynamic_supervisor"
+        if proposed_mode == "full_artifact":
+            proposed_type = str(proposed.get("artifact_type", "")).strip()[:80]
+            if proposed_type:
+                contract["artifact_type"] = proposed_type
+            for key in ("target_characters", "target_parts"):
+                if int(contract.get(key, 0) or 0) > 0:
+                    continue
+                try:
+                    contract[key] = max(0, int(proposed.get(key, 0) or 0))
+                except (TypeError, ValueError):
+                    contract[key] = 0
+            if not contract.get("target_parts"):
+                target_characters = int(contract.get("target_characters", 0) or 0)
+                contract["target_parts"] = (
+                    max(self.default_agents - 1, math.ceil(target_characters / self.target_artifact_characters))
+                    if target_characters else max(1, self.default_agents - 1)
+                )
+            reserved = 2 if self.max_workers >= 3 else max(0, self.max_workers - 1)
+            contract["target_parts"] = max(
+                1, min(int(contract["target_parts"]), max(1, self.max_workers - reserved))
+            )
+            contract["assembly"] = "ordered_lossless"
+            contract["summary_may_replace_deliverable"] = False
+        else:
+            contract["assembly"] = "model_synthesis"
+            contract["summary_may_replace_deliverable"] = True
+        return contract
+
+    @staticmethod
+    def _parse_character_target(text: str) -> int:
+        ten_thousands = re.search(r"(\d+(?:\.\d+)?)\s*万\s*(?:字|字符)", text)
+        if ten_thousands:
+            return min(2_000_000, max(1, round(float(ten_thousands.group(1)) * 10_000)))
+        exact = re.search(r"(?<!\d)(\d[\d,，]*)\s*(?:字|字符)", text)
+        if exact:
+            return min(2_000_000, max(1, int(exact.group(1).replace(",", "").replace("，", ""))))
+        return 0
+
+    @staticmethod
+    def _parse_part_target(text: str, artifact_type: str) -> int:
+        units = "章|章节" if artifact_type in {"小说", "故事"} else "章|章节|部分|节|篇|模块"
+        match = re.search(rf"(?<!\d)(\d{{1,3}})\s*(?:个)?(?:{units})", text)
+        return int(match.group(1)) if match else 0
+
+    def _apply_delivery_contract(
+        self,
+        tasks: list[dict[str, Any]],
+        question: str,
+    ) -> list[dict[str, Any]]:
+        """Turn a full-deliverable request into runtime-generated ordered artifacts."""
+        if self._delivery_contract.get("response_mode") != "full_artifact":
+            return tasks
+
+        artifact_type = str(self._delivery_contract.get("artifact_type") or "内容")
+        part_count = max(1, int(self._delivery_contract.get("target_parts", 1)))
+        target_total = max(0, int(self._delivery_contract.get("target_characters", 0)))
+        outline_template = next((
+            dict(task) for task in tasks
+            if any(term in f"{task.get('objective', '')}{task.get('agent_name', '')}" for term in ("大纲", "总纲", "结构", "规划"))
+        ), None)
+        content_template = next((
+            dict(task) for task in tasks
+            if str(task.get("output_mode", "")).casefold() == "artifact"
+            or any(term in str(task.get("objective", "")) for term in ("撰写", "创作", "正文", "章节", "实现"))
+        ), None)
+
+        outline = outline_template or {
+            "objective": f"为{artifact_type}生成完整结构与各部分约束",
+            "query": f"根据用户目标设计{artifact_type}整体结构，明确每一部分的内容、衔接和一致性约束。",
+            "agent_name": f"{artifact_type}结构规划 Agent",
+            "agent_instruction": f"为当前{artifact_type}即时生成可执行结构，逐部分说明目标、承接关系与必须保持的一致性。",
+            "capabilities": ["结构规划", "一致性约束"],
+            "tools": ["model_reasoning"],
+            "source_policy": "none" if not self.index.chunks else "optional",
+            "priority": 100,
+        }
+        outline.update({
+            "task_id": "task_01",
+            "base_task_id": str(outline.get("task_id", "task_01")),
+            "depends_on": [],
+            "phase": 0,
+            "output_mode": "finding",
+            "include_in_final": False,
+            "sequence": 0,
+            "target_characters": 0,
+            "artifact_label": f"{artifact_type}结构",
+            "input_budget": min(
+                self.ROLE_BUDGETS["worker"], self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN
+            ),
+            "required_targets": [],
+        })
+
+        result = [outline] if self.max_workers > 1 else []
+        outline_dependency = ["task_01"] if result else []
+        first_content_task_number = 2 if result else 1
+        if artifact_type in {"小说", "故事"}:
+            label = lambda index: f"第{index}章"
+        else:
+            label = lambda index: f"第{index}部分"
+        base_characters, remainder = divmod(target_total, part_count) if target_total else (0, 0)
+        for index in range(1, part_count + 1):
+            section_label = label(index)
+            minimum = base_characters + (1 if index <= remainder else 0)
+            template = dict(content_template or {})
+            capabilities = template.get("capabilities") or ["内容生成", "上下文衔接", "自检"]
+            template.update({
+                "task_id": f"task_{index + first_content_task_number - 1:02d}",
+                "base_task_id": str(template.get("task_id", f"generated_part_{index:02d}")),
+                "objective": f"完成{artifact_type}{section_label}的完整正文",
+                "query": (
+                    f"用户总目标：{question}\n依据整体结构，生成{section_label}完整正文。"
+                    + (f"正文不得少于 {minimum} 个字符。" if minimum else "交付可直接使用的完整正文。")
+                )[:1_000],
+                "agent_name": f"{artifact_type}{section_label}生成 Agent",
+                "agent_instruction": (
+                    f"独立完成{section_label}的可直接交付正文；遵守结构 Agent 给出的设定和衔接约束；"
+                    "不得返回摘要、完成报告、写作说明或省略号占位。"
+                ),
+                "capabilities": list(capabilities),
+                "tools": ["model_reasoning"],
+                "source_policy": "none" if not self.index.chunks else str(template.get("source_policy", "optional")),
+                "priority": max(1, 100 - index),
+                "input_budget": min(
+                    self.ROLE_BUDGETS["worker"], self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN
+                ),
+                "depends_on": outline_dependency,
+                "phase": 1 if outline_dependency else 0,
+                "required_targets": [],
+                "output_mode": "artifact",
+                "include_in_final": True,
+                "sequence": index,
+                "target_characters": minimum,
+                "artifact_label": section_label,
+            })
+            result.append(template)
+        if len(result) < self.max_workers and result and outline_dependency:
+            review_template = next((
+                dict(task) for task in tasks
+                if any(term in f"{task.get('objective', '')}{task.get('agent_name', '')}" for term in ("一致性", "审查", "校验", "检查"))
+            ), {})
+            content_task_ids = [
+                str(task["task_id"]) for task in result if task.get("output_mode") == "artifact"
+            ]
+            review_template.update({
+                "task_id": f"task_{len(result) + 1:02d}",
+                "base_task_id": str(review_template.get("task_id", "generated_review")),
+                "objective": f"检查{artifact_type}各部分的连续性与交付完整性",
+                "query": f"检查{artifact_type}各部分是否遵守整体结构，指出矛盾、断裂、缺漏和未完成内容。",
+                "agent_name": f"{artifact_type}整体审校 Agent",
+                "agent_instruction": "根据结构摘要和各部分的有界摘要执行整体审校，不改写或替代原始正文。",
+                "capabilities": ["一致性审查", "完整性检查"],
+                "tools": ["model_reasoning"],
+                "source_policy": "none",
+                "priority": 1,
+                "input_budget": min(
+                    self.ROLE_BUDGETS["worker"], self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN
+                ),
+                "depends_on": content_task_ids,
+                "phase": 2,
+                "required_targets": [],
+                "output_mode": "finding",
+                "include_in_final": False,
+                "sequence": 0,
+                "target_characters": 0,
+                "artifact_label": f"{artifact_type}整体审校",
+            })
+            result.append(review_template)
+        return result[: self.max_workers]
 
     def _normalize_tasks(self, raw_tasks: Any, question: str) -> list[dict[str, Any]]:
         tasks: list[TaskSpec] = []
@@ -337,6 +637,14 @@ class MultiAgentResearchSystem:
                 )
                 phases = {item.task_id: item.phase for item in tasks}
                 phase = 1 + max((phases[item] for item in depends_on), default=-1)
+                output_mode = str(raw.get("output_mode", "finding")).strip().casefold()
+                if output_mode not in OUTPUT_MODES:
+                    output_mode = "finding"
+                try:
+                    sequence = max(0, int(raw.get("sequence", 0)))
+                    target_characters = max(0, int(raw.get("target_characters", 0)))
+                except (TypeError, ValueError):
+                    sequence, target_characters = 0, 0
                 tasks.append(TaskSpec(
                     task_id=f"task_{len(tasks) + 1:02d}",
                     objective=objective,
@@ -354,6 +662,11 @@ class MultiAgentResearchSystem:
                     depends_on=depends_on,
                     phase=phase,
                     required_targets=(objective,) if source_policy == "required" else (),
+                    output_mode=output_mode,
+                    include_in_final=bool(raw.get("include_in_final", output_mode == "artifact")),
+                    sequence=sequence,
+                    target_characters=target_characters,
+                    artifact_label=str(raw.get("artifact_label") or objective)[:120],
                 ))
         if not tasks:
             tasks = [TaskSpec(
@@ -515,6 +828,9 @@ class MultiAgentResearchSystem:
             "source_scaling_active": source_scaling,
             "required_targets": combined_targets,
             "allocation_reason": "；".join(reasons),
+            "parallel_workers": self.parallel_workers,
+            "max_artifact_output_tokens": self.max_artifact_output_tokens,
+            "target_artifact_characters": self.target_artifact_characters,
         }
         return allocated_tasks
 
@@ -557,11 +873,10 @@ class MultiAgentResearchSystem:
             Send("worker", {
                 "question": state["question"],
                 "task": task,
-                "dependency_findings": [
-                    MultiAgentResearchSystem._finding_summary(findings_by_task[dependency])
-                    for dependency in task.get("depends_on", [])
-                    if dependency in findings_by_task
-                ],
+                "dependency_findings": MultiAgentResearchSystem._bounded_finding_summaries([
+                    findings_by_task[dependency]
+                    for dependency in task.get("depends_on", []) if dependency in findings_by_task
+                ]),
             })
             for task in state.get("active_tasks", [])
         ]
@@ -634,47 +949,106 @@ class MultiAgentResearchSystem:
             "target_candidates": retrieval_meta.get("target_candidates", {}),
             "retrieval_strategy": retrieval_strategy,
         }
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "ROLE:DYNAMIC_WORKER。你不是预制角色，而是 Supervisor 为当前问题即时创建的执行 Agent。"
-                    f"Agent 名称：{task['agent_name']}。任务指令：{task['agent_instruction']}。"
-                    f"能力：{json.dumps(task.get('capabilities', []), ensure_ascii=False)}。"
-                    f"允许工具：{json.dumps(task.get('tools', []), ensure_ascii=False)}。"
-                    f"来源策略：{task.get('source_policy', 'none')}。"
-                    "你只处理当前子任务，不知道其他 Worker 的消息，也不能调用未授权工具。"
-                    "来源策略为 required 时，事实结论必须引用给定 evidence_id；为 none 时可使用模型通用知识。"
-                    "返回JSON：{\"summary\":...,\"facts\":[...],\"claims\":[...],"
-                    "\"uncertainties\":[...],\"contradictions\":[...],"
-                    "\"evidence_ids\":[...],\"confidence\":0到1}。不得编造证据ID。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"task_id：{task['task_id']}\n目标：{task['objective']}\n"
-                    f"工作查询：{task['query']}\n"
-                    + (
-                        "依赖任务的结构化结果：\n"
-                        f"{json.dumps(state.get('dependency_findings', []), ensure_ascii=False)}\n"
-                        if state.get("dependency_findings") else ""
-                    )
-                    + (
-                        f"有界对话记忆（只用于理解当前问题，不可作为事实证据）：\n"
-                        f"{self._conversation_context}\n"
-                        if self._conversation_context else ""
-                    )
-                    + f"\n本任务可见的外部资料：\n{packed or '未提供外部资料；请按来源策略使用模型能力完成任务。'}"
-                ),
-            },
-        ]
-        parsed, _ = self._call_json(
-            "worker",
-            messages,
-            max_tokens=1_800,
-            required_keys=("summary", "evidence_ids"),
+        dependency_block = (
+            "依赖任务的结构化结果：\n"
+            f"{json.dumps(state.get('dependency_findings', []), ensure_ascii=False)}\n"
+            if state.get("dependency_findings") else ""
         )
+        conversation_block = (
+            "有界对话记忆（只用于理解当前问题，不可作为事实证据）：\n"
+            f"{self._conversation_context}\n"
+            if self._conversation_context else ""
+        )
+        deliverable_artifact_id = ""
+        if task.get("output_mode") == "artifact":
+            target_characters = max(0, int(task.get("target_characters", 0) or 0))
+            requested_characters = math.ceil(target_characters * 1.15) if target_characters else 0
+            artifact_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "ROLE:DYNAMIC_WORKER。你是 Supervisor 根据当前交付任务即时生成的内容 Agent。"
+                        f"Agent 名称：{task['agent_name']}。任务指令：{task['agent_instruction']}。"
+                        "本次响应会被程序作为最终产物原文保存并按顺序无损组装。"
+                        "只输出可直接交付的正文，不输出 JSON，不写完成情况、摘要、解释、字数统计或 Validator 报告；"
+                        "不得用‘略’、省略号或提纲代替正文。可以使用 Markdown 标题和正常段落。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"总体请求：{state['question']}\n"
+                        f"当前部分：{task.get('artifact_label') or task['objective']}\n"
+                        f"当前目标：{task['objective']}\n工作要求：{task['query']}\n"
+                        + (f"请生成至少 {requested_characters} 个字符，确保硬性下限为 {target_characters} 个字符。\n" if target_characters else "")
+                        + dependency_block
+                        + conversation_block
+                        + f"可选外部资料：\n{packed or '无；使用模型原生能力完成。'}"
+                    ),
+                },
+            ]
+            output_tokens = min(
+                self.max_artifact_output_tokens,
+                max(2_400, math.ceil(max(1, requested_characters) * 1.8)),
+            )
+            deliverable_text = self._call(
+                "worker", artifact_messages, max_tokens=output_tokens
+            ).strip()
+            deliverable_artifact_id = self.artifacts.put(
+                "deliverable",
+                deliverable_text,
+                {
+                    "task_id": task["task_id"],
+                    "agent_name": task["agent_name"],
+                    "sequence": int(task.get("sequence", 0) or 0),
+                    "label": str(task.get("artifact_label", "")),
+                    "target_characters": target_characters,
+                },
+            )
+            parsed = {
+                "summary": (
+                    f"{task.get('artifact_label') or task['objective']}正文片段："
+                    f"{deliverable_text[:1_200]}"
+                ),
+                "facts": [],
+                "claims": [],
+                "uncertainties": [],
+                "contradictions": [],
+                "evidence_ids": [],
+                "confidence": 0.9,
+            }
+        else:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "ROLE:DYNAMIC_WORKER。你不是预制角色，而是 Supervisor 为当前问题即时创建的执行 Agent。"
+                        f"Agent 名称：{task['agent_name']}。任务指令：{task['agent_instruction']}。"
+                        f"能力：{json.dumps(task.get('capabilities', []), ensure_ascii=False)}。"
+                        f"允许工具：{json.dumps(task.get('tools', []), ensure_ascii=False)}。"
+                        f"来源策略：{task.get('source_policy', 'none')}。"
+                        "你只处理当前子任务，不知道其他 Worker 的消息，也不能调用未授权工具。"
+                        "来源策略为 required 时，事实结论必须引用给定 evidence_id；为 none 时可使用模型通用知识。"
+                        "返回JSON：{\"summary\":...,\"facts\":[...],\"claims\":[...],"
+                        "\"uncertainties\":[...],\"contradictions\":[...],"
+                        "\"evidence_ids\":[...],\"confidence\":0到1}。不得编造证据ID。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"task_id：{task['task_id']}\n目标：{task['objective']}\n"
+                        f"工作查询：{task['query']}\n"
+                        + dependency_block
+                        + conversation_block
+                        + f"\n本任务可见的外部资料：\n{packed or '未提供外部资料；请按来源策略使用模型能力完成任务。'}"
+                    ),
+                },
+            ]
+            parsed, _ = self._call_json(
+                "worker", messages, max_tokens=1_800,
+                required_keys=("summary", "evidence_ids"),
+            )
         valid_ids = [
             item for item in parsed.get("evidence_ids", [])
             if isinstance(item, str) and item in evidence_ids
@@ -719,6 +1093,16 @@ class MultiAgentResearchSystem:
             "required_targets": task.get("required_targets", []),
             "coverage": coverage,
             "negative_claim": self._looks_negative(summary),
+            "output_mode": task.get("output_mode", "finding"),
+            "include_in_final": bool(task.get("include_in_final", False)),
+            "sequence": int(task.get("sequence", 0) or 0),
+            "target_characters": int(task.get("target_characters", 0) or 0),
+            "artifact_label": str(task.get("artifact_label", "")),
+            "deliverable_artifact_id": deliverable_artifact_id,
+            "deliverable_characters": (
+                len(self.artifacts.get(deliverable_artifact_id).content)
+                if deliverable_artifact_id and self.artifacts.get(deliverable_artifact_id) else 0
+            ),
         }
         finding["artifact_id"] = self.artifacts.put(
             "finding", json.dumps(finding, ensure_ascii=False),
@@ -736,6 +1120,10 @@ class MultiAgentResearchSystem:
                     f"工具={','.join(task.get('tools', []))}；分片大小={task.get('shard_bytes', 0)} Bytes；"
                     f"资料策略={retrieval_strategy}；"
                     f"覆盖={scanned_chunks}/{assigned_chunks}；引用 {len(valid_ids)} 个证据对象"
+                    + (
+                        f"；完整产物={finding['deliverable_characters']} 字符，已写入独立 Artifact"
+                        if deliverable_artifact_id else ""
+                    )
                 ),
                 "artifact_id": finding["artifact_id"],
             }],
@@ -909,7 +1297,51 @@ class MultiAgentResearchSystem:
         }
 
     def _reduce_tree(self, state: GraphState) -> dict[str, Any]:
-        current = [self._finding_summary(item) for item in self._deduplicate_findings(state["findings"])]
+        deduplicated = self._deduplicate_findings(state["findings"])
+        if self._delivery_contract.get("response_mode") == "full_artifact":
+            summaries = self._bounded_finding_summaries(deduplicated)
+            reduced = {
+                "summary": (
+                    f"完整产物正文保存在 {sum(bool(item.get('deliverable_artifact_id')) for item in deduplicated)} "
+                    "个独立 Artifact 中；Reducer 仅合并有界审校账本。"
+                ),
+                "facts": list(dict.fromkeys(
+                    str(value)[:800] for item in summaries for value in item.get("facts", [])
+                    if str(value).strip()
+                ))[:80],
+                "claims": list(dict.fromkeys(
+                    str(value)[:800] for item in summaries for value in item.get("claims", [])
+                    if str(value).strip()
+                ))[:80],
+                "unresolved_questions": list(dict.fromkeys(
+                    str(value)[:800] for item in summaries for value in item.get("uncertainties", [])
+                    if str(value).strip()
+                ))[:40],
+                "contradictions": list(dict.fromkeys(
+                    str(value)[:800] for item in summaries for value in item.get("contradictions", [])
+                    if str(value).strip()
+                ))[:40],
+                "evidence_ids": list(dict.fromkeys(
+                    evidence_id for item in summaries for evidence_id in item.get("evidence_ids", [])
+                    if isinstance(evidence_id, str)
+                )),
+                "deliverable_artifact_ids": [
+                    str(item.get("deliverable_artifact_id")) for item in deduplicated
+                    if item.get("deliverable_artifact_id")
+                ],
+                "coverage": self._merge_coverage([item.get("coverage", {}) for item in summaries]),
+            }
+            reduced["artifact_id"] = self.artifacts.put(
+                "reduction", json.dumps(reduced, ensure_ascii=False), {"mode": "deterministic_deliverable_ledger"}
+            )
+            return {
+                "reduced": reduced,
+                "trace": [{
+                    "node": "reducer", "role": "确定性产物账本", "status": "completed",
+                    "detail": "完整正文不进入 Reducer 提示词；仅合并有界摘要、矛盾和 Artifact ID",
+                }],
+            }
+        current = [self._finding_summary(item) for item in deduplicated]
         trace: list[dict[str, Any]] = []
         level = 0
         while len(current) > 1:
@@ -1002,6 +1434,33 @@ class MultiAgentResearchSystem:
         tasks = state.get("tasks", [])
         findings = self._deduplicate_findings(state.get("findings", []))
         hard = self._hard_validation(tasks, findings, state.get("reduced", {}))
+        full_artifact = bool(hard.get("deliverable", {}).get("required"))
+        if full_artifact:
+            control_tasks = [task for task in tasks if not task.get("include_in_final")]
+            control_findings = [item for item in findings if not item.get("include_in_final")]
+            task_payload = [
+                *self._bounded_task_summaries(control_tasks),
+                {
+                    "task_id": "deliverable_parts_aggregate",
+                    "objective": "完整产物的全部有序正文部分",
+                    "output_mode": "artifact",
+                    "part_count": hard["deliverable"].get("expected_parts", 0),
+                    "target_characters": hard["deliverable"].get("target_characters", 0),
+                    "actual_characters": hard["deliverable"].get("actual_characters", 0),
+                },
+            ]
+            finding_payload = self._bounded_finding_summaries(
+                control_findings, total_character_budget=24_000
+            )
+            hard_payload = dict(hard)
+            hard_payload["deliverable"] = {
+                key: value for key, value in hard.get("deliverable", {}).items()
+                if key != "parts"
+            }
+        else:
+            task_payload = self._bounded_task_summaries(tasks)
+            finding_payload = self._bounded_finding_summaries(findings)
+            hard_payload = hard
         messages = [
             {"role": "system", "content": (
                 "ROLE:VALIDATOR。你只做语义质量检查，不能改变工作流或放宽程序规则。"
@@ -1013,9 +1472,9 @@ class MultiAgentResearchSystem:
                 "\"contradictions\":[...],\"notes\":...}。"
             )},
             {"role": "user", "content": json.dumps({
-                "tasks": tasks,
-                "findings": [self._finding_summary(item) for item in findings],
-                "hard_validation": hard,
+                "tasks": task_payload,
+                "findings": finding_payload,
+                "hard_validation": hard_payload,
                 "coverage": hard.get("coverage", {}),
             }, ensure_ascii=False)},
         ]
@@ -1160,6 +1619,13 @@ class MultiAgentResearchSystem:
         ]
         if unresolved_targets:
             invalid.append("missing_required_entity")
+        deliverable = self._build_deliverable_report(tasks, findings)
+        if deliverable["required"] and not deliverable["complete"]:
+            invalid.extend(
+                f"deliverable_{code}"
+                for code in deliverable.get("failure_codes", [])
+            )
+            missing.extend(deliverable.get("retryable_task_ids", []))
         missing = sorted(set(missing))
         checks = {
             "unique_task_ids": len(task_ids) == len(set(task_ids)) and all(task_ids),
@@ -1170,15 +1636,96 @@ class MultiAgentResearchSystem:
             "source_coverage_complete": not coverage_report["required"] or coverage_report["complete"],
             "negative_claims_supported": not unsupported_negative,
             "required_targets_resolved": not unresolved_targets,
+            "deliverable_complete": not deliverable["required"] or deliverable["complete"],
         }
         return {
             "passed": all(bool(value) for value in checks.values()),
             "checks": checks,
             "missing_task_ids": missing,
             "violations": invalid,
-            "retryable_task_ids": missing,
+            "retryable_task_ids": sorted(set([*missing, *deliverable.get("retryable_task_ids", [])])),
             "unresolved_targets": unresolved_targets,
             "coverage": coverage_report,
+            "deliverable": deliverable,
+        }
+
+    def _build_deliverable_report(
+        self,
+        tasks: list[dict[str, Any]],
+        findings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        artifact_tasks = [
+            task for task in tasks
+            if task.get("output_mode") == "artifact" and task.get("include_in_final")
+        ]
+        if not artifact_tasks:
+            return {
+                "required": False, "complete": True, "response_mode": "synthesis",
+                "expected_parts": 0, "completed_parts": 0, "target_characters": 0,
+                "actual_characters": 0, "parts": [], "failure_codes": [],
+                "retryable_task_ids": [],
+            }
+        findings_by_task = {str(item.get("task_id", "")): item for item in findings}
+        parts: list[dict[str, Any]] = []
+        retryable: list[str] = []
+        failure_codes: list[str] = []
+        seen_sequences: set[int] = set()
+        for task in sorted(artifact_tasks, key=lambda item: int(item.get("sequence", 0) or 0)):
+            task_id = str(task.get("task_id", ""))
+            finding = findings_by_task.get(task_id, {})
+            artifact_id = str(finding.get("deliverable_artifact_id", ""))
+            artifact = self.artifacts.get(artifact_id)
+            sequence = int(task.get("sequence", 0) or 0)
+            target = int(task.get("target_characters", 0) or 0)
+            actual = len(artifact.content) if artifact and artifact.kind == "deliverable" else 0
+            valid = bool(artifact and artifact.kind == "deliverable" and artifact.content.strip())
+            short = bool(valid and target and actual < target)
+            if not valid:
+                failure_codes.append("artifact_missing")
+                retryable.append(task_id)
+            if short:
+                failure_codes.append("part_too_short")
+                retryable.append(task_id)
+            if sequence <= 0 or sequence in seen_sequences:
+                failure_codes.append("sequence_invalid")
+            seen_sequences.add(sequence)
+            parts.append({
+                "task_id": task_id,
+                "sequence": sequence,
+                "label": str(task.get("artifact_label", "")),
+                "artifact_id": artifact_id,
+                "target_characters": target,
+                "actual_characters": actual,
+                "valid": valid,
+                "short": short,
+            })
+        target_total = int(self._delivery_contract.get("target_characters", 0) or 0)
+        actual_total = sum(item["actual_characters"] for item in parts)
+        if target_total and actual_total < target_total:
+            failure_codes.append("total_too_short")
+            retryable.extend(
+                item["task_id"] for item in parts
+                if item["actual_characters"] < item["target_characters"]
+            )
+        expected_sequences = set(range(1, len(artifact_tasks) + 1))
+        if seen_sequences != expected_sequences:
+            failure_codes.append("sequence_incomplete")
+        failure_codes = list(dict.fromkeys(failure_codes))
+        retryable = list(dict.fromkeys(item for item in retryable if item))
+        return {
+            "required": True,
+            "complete": not failure_codes,
+            "response_mode": "full_artifact",
+            "artifact_type": self._delivery_contract.get("artifact_type", "通用内容"),
+            "expected_parts": len(artifact_tasks),
+            "completed_parts": sum(item["valid"] for item in parts),
+            "target_characters": target_total,
+            "actual_characters": actual_total,
+            "assembled_outside_model_window": True,
+            "summary_may_replace_deliverable": False,
+            "parts": parts,
+            "failure_codes": failure_codes,
+            "retryable_task_ids": retryable,
         }
 
     def _build_coverage_report(
@@ -1283,6 +1830,41 @@ class MultiAgentResearchSystem:
 
     def _finalize(self, state: GraphState) -> dict[str, Any]:
         validation = state.get("validation", {})
+        deliverable = validation.get("hard_checks", {}).get("deliverable", {})
+        if deliverable.get("required"):
+            findings_by_task = {
+                str(item.get("task_id", "")): item
+                for item in self._deduplicate_findings(state.get("findings", []))
+            }
+            assembled: list[str] = []
+            for part in sorted(deliverable.get("parts", []), key=lambda item: int(item.get("sequence", 0))):
+                finding = findings_by_task.get(str(part.get("task_id", "")), {})
+                artifact = self.artifacts.get(str(finding.get("deliverable_artifact_id", "")))
+                if artifact is None or artifact.kind != "deliverable" or not artifact.content.strip():
+                    continue
+                content = artifact.content.strip()
+                label = str(part.get("label", "")).strip()
+                if label and label not in content[:160]:
+                    content = f"## {label}\n\n{content}"
+                assembled.append(content)
+            answer = "\n\n".join(assembled).strip()
+            if not validation.get("approved"):
+                failures = "、".join(deliverable.get("failure_codes", [])) or "语义校验未通过"
+                answer = (
+                    f"> 交付校验未完全通过（{failures}）。以下仍返回已生成的全部原文，未用摘要替代。\n\n"
+                    f"{answer}"
+                ).strip()
+            return {
+                "answer": answer or "没有生成可交付的正文。",
+                "stop_reason": "validated_full_artifact" if validation.get("approved") else "partial_artifact_returned",
+                "trace": [{
+                    "node": "finalizer", "role": "确定性产物组装器", "status": "completed",
+                    "detail": (
+                        f"按顺序无损组装 {len(assembled)}/{deliverable.get('expected_parts', 0)} 个正文 Artifact；"
+                        f"最终返回 {len(answer)} 字符；未调用模型概括或改写正文"
+                    ),
+                }],
+            }
         messages = [
             {"role": "system", "content": (
                 "ROLE:FINALIZER。根据动态 Agent 的归并结果和 Validator 报告直接回答用户问题。"
@@ -1324,9 +1906,13 @@ class MultiAgentResearchSystem:
         role_budget = min(self.ROLE_BUDGETS[role], self.context_limit - reserved_output - SAFETY_MARGIN)
         if preflight > role_budget:
             raise ValueError(f"{role} Agent 输入约 {preflight} Token，超过其 {role_budget} Token 独立预算")
-        with self._model_lock:
+        if getattr(self.model, "supports_parallel_requests", False):
             response = self.model.chat(messages, temperature=0.1, max_tokens=max_tokens)
             usage = getattr(self.model, "last_usage", None)
+        else:
+            with self._model_lock:
+                response = self.model.chat(messages, temperature=0.1, max_tokens=max_tokens)
+                usage = getattr(self.model, "last_usage", None)
         actual = usage.get("prompt_tokens") if isinstance(usage, dict) else None
         completion = usage.get("completion_tokens") if isinstance(usage, dict) else None
         measured_prompt = int(actual if actual is not None else preflight)
@@ -1446,12 +2032,23 @@ class MultiAgentResearchSystem:
             "planning_source": self._planning_source,
             "intent": self._intent,
             "agent_strategy": self._agent_strategy,
+            "runtime_settings": {
+                "default_agents": self.default_agents,
+                "max_agents": self.max_workers,
+                "parallel_workers": self.parallel_workers,
+                "reduce_fan_in": self.reduce_fan_in,
+                "max_replans": self.max_replans,
+                "max_artifact_output_tokens": self.max_artifact_output_tokens,
+                "target_artifact_characters": self.target_artifact_characters,
+            },
             "available_tools": sorted(self.available_tools),
             "structured_output_retries": self._json_retries,
             "retrieval_strategies": sorted(self._retrieval_strategies),
             "agent_allocation": dict(self._allocation),
             "dependency_phases": max((int(task.get("phase", 0)) for task in tasks), default=0) + 1,
             "coverage_report": self._build_coverage_report(tasks, findings),
+            "delivery_contract": dict(self._delivery_contract),
+            "deliverable_report": self._build_deliverable_report(tasks, findings),
             "token_accounting": {
                 "mode": (
                     "api_usage" if self._calls and all(call.get("actual_prompt_tokens") is not None for call in self._calls)
@@ -1513,11 +2110,55 @@ class MultiAgentResearchSystem:
             "depends_on": finding.get("depends_on", [])[:16],
             "phase": finding.get("phase", 0),
             "required_targets": finding.get("required_targets", [])[:16],
+            "output_mode": finding.get("output_mode", "finding"),
+            "include_in_final": bool(finding.get("include_in_final", False)),
+            "sequence": int(finding.get("sequence", 0) or 0),
+            "artifact_label": str(finding.get("artifact_label", ""))[:120],
+            "deliverable_artifact_id": finding.get("deliverable_artifact_id", ""),
+            "target_characters": int(finding.get("target_characters", 0) or 0),
+            "deliverable_characters": int(finding.get("deliverable_characters", 0) or 0),
             "coverage": {
                 key: value for key, value in finding.get("coverage", {}).items()
                 if key != "packed_chunk_ids"
             },
         }
+
+    @staticmethod
+    def _bounded_finding_summaries(
+        findings: list[dict[str, Any]],
+        *,
+        total_character_budget: int = 36_000,
+    ) -> list[dict[str, Any]]:
+        """Keep high-fan-in dependency and validation prompts below one model window."""
+        if not findings:
+            return []
+        per_item = max(120, min(1_500, total_character_budget // len(findings)))
+        summaries: list[dict[str, Any]] = []
+        for finding in findings:
+            item = MultiAgentResearchSystem._finding_summary(finding)
+            item["summary"] = str(item.get("summary", ""))[:per_item]
+            item["facts"] = [str(value)[:240] for value in item.get("facts", [])[:3]]
+            item["claims"] = [str(value)[:240] for value in item.get("claims", [])[:3]]
+            item["uncertainties"] = [str(value)[:200] for value in item.get("uncertainties", [])[:2]]
+            item["contradictions"] = [str(value)[:200] for value in item.get("contradictions", [])[:2]]
+            summaries.append(item)
+        return summaries
+
+    @staticmethod
+    def _bounded_task_summaries(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{
+            "task_id": task.get("task_id"),
+            "objective": str(task.get("objective", ""))[:180],
+            "agent_name": str(task.get("agent_name", ""))[:80],
+            "source_policy": task.get("source_policy", "none"),
+            "depends_on": task.get("depends_on", [])[:128],
+            "phase": task.get("phase", 0),
+            "output_mode": task.get("output_mode", "finding"),
+            "include_in_final": bool(task.get("include_in_final", False)),
+            "sequence": int(task.get("sequence", 0) or 0),
+            "target_characters": int(task.get("target_characters", 0) or 0),
+            "artifact_label": str(task.get("artifact_label", ""))[:100],
+        } for task in tasks]
 
     @staticmethod
     def _merge_coverage(items: list[dict[str, Any]]) -> dict[str, Any]:

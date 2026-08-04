@@ -125,7 +125,7 @@ flowchart TB
     TOOLBOX -.-> W2
     TOOLBOX -.-> WN
 
-    W1 --> STORE["⑤ Artifact Store / 结构化状态<br/>Finding、草稿、代码结果、事实账本<br/>冲突、不确定项与对象引用"]
+    W1 --> STORE["⑤ Artifact Store / 窗口外状态<br/>Finding 摘要或完整 Deliverable 原文<br/>冲突、不确定项与对象引用"]
     W2 --> STORE
     WN --> STORE
     STORE --> MORE{"DAG 中还有 Ready 任务？"}
@@ -134,15 +134,21 @@ flowchart TB
     R --> V["⑦ Validator<br/>程序契约 + LLM 语义质量检查"]
     V --> G{"完成标准全部满足？"}
 
-    G -->|"是"| F["⑨ Finalizer<br/>生成最终答案或交付物"]
+    G -->|"综合回答"| F["⑨a LLM Finalizer<br/>根据归并结果生成答案"]
+    G -->|"完整产物"| A["⑨b 确定性组装器<br/>按 sequence 无损读取全部正文"]
     G -->|"存在可修复缺口"| RP["⑧ Supervisor Replan<br/>只重建失败任务与必要下游"]
     RP --> READY
-    G -->|"不可修复或达到上限"| F
+    G -->|"不可修复或达到上限"| ROUTE{"按交付契约返回"}
+    ROUTE --> F
+    ROUTE --> A
 
     F --> OUTPUT["回答 / 报告 / 方案 / 代码 / 创作内容<br/>质量状态 + 执行轨迹 + 可选来源"]
+    A --> OUTPUT
 ```
 
-一次循环先执行依赖已经满足的任务波次。一个波次结束后，调度器只把结构化产物交给下游任务，例如“先生成十章大纲，再让十个章节 Agent 依据对应大纲写作，最后执行一致性检查”。同一机制也可用于软件设计、经营分析、计划制定和大规模资料处理；区别只是 AgentSpec 和授权工具不同。全部波次完成后才进入 Reducer 和 Validator。Validator 通过时进入 Finalizer；验证失败时，只有存在可修复任务且尚未达到 `max_replans`，LangGraph 才把失败的 `task_id` 送回调度节点。已经通过的任务不会重复执行，完整工作历史也不会在 Agent 之间传递。
+一次循环先执行依赖已经满足的任务波次。一个波次结束后，调度器只把有界摘要和 Artifact ID 交给下游任务，例如“先生成十章大纲，再让十个章节 Agent 依据大纲写作，最后执行一致性检查”。章节正文仍完整保存在 Artifact Store，不会被放进 Reducer 的提示词。全部波次完成后才进入 Reducer 和 Validator。普通分析请求由 LLM Finalizer 综合回答；明确要求小说全文、完整报告、代码成品等内容时，系统选择 `full_artifact` 交付契约，由程序按顺序读取各部分原文并直接拼接，禁止 Reducer 或 Finalizer 用概括替代正文。验证失败时，只有存在可修复任务且尚未达到 `max_replans`，LangGraph 才把失败的 `task_id` 送回调度节点。
+
+摘要不是按固定产品类型启用。系统先读取问题中的交付意图，再决定最终形式：用户明确要求“总结、概括、摘要”时强制使用 `synthesis`；明确要求“完整、全文、成稿、不要概括”时强制使用 `full_artifact`；表达不明确时由 Supervisor 根据目标判断。用户的明确表达优先级高于 Supervisor，例如“分析这部小说”会综合回答，“写出整部小说”才返回全部正文；“总结这份报告”会摘要，“撰写可直接提交的报告”会保留完整产物。
 
 | 循环要素 | 系统中的具体含义 |
 |---|---|
@@ -165,16 +171,18 @@ flowchart LR
     PLAN --> PACK["每个 Worker 只接收<br/>当前子任务 + 必要上游产物<br/>独立预算与工具权限"]
     PACK --> WORKER["通用 Worker LLM 调用"]
     TOOL["可选能力<br/>模型知识 / 文档与网页<br/>代码与数据 / 企业系统"] -. "仅返回当前任务的有界结果" .-> PACK
-    WORKER --> FINDING["输出结构化 Artifact<br/>大对象保存在窗口外并传递 ID"]
-    FINDING --> REDUCE["Tree Reducer<br/>固定扇入、逐层归并 Artifact"]
-    REDUCE --> FINAL["Validator + Finalizer<br/>只读取归并结果与质量报告"]
+    WORKER --> FINDING["输出 Finding 或 Deliverable<br/>完整正文保存在窗口外并传递 ID"]
+    FINDING --> REDUCE["Tree Reducer<br/>只归并有界摘要与事实账本"]
+    REDUCE --> FINAL["Validator<br/>检查语义、部分数与实际字符数"]
+    FINDING --> ASSEMBLE["确定性完整产物组装器<br/>按顺序读取原文，不再次调用 LLM"]
+    FINAL --> ASSEMBLE
 
     LIMIT["统一预算门<br/>输入 Token + 输出预留 + 安全余量 ≤ 64K"] -. "调用前检查" .-> WORKER
     LIMIT -.-> REDUCE
     LIMIT -.-> FINAL
 ```
 
-关键点是将上下文按职责和依赖边界分散，而不是把多个 Agent 的内容重新拼回同一个大 Prompt。Supervisor 只管理 AgentSpec、DAG 和状态，Worker 不共享彼此历史，Reducer 只读取结构化 Artifact，Finalizer 不接收所有执行过程；大对象、Artifact 和 LangGraph Checkpoint 始终位于模型窗口之外。是否使用 RAG 只由具体 AgentSpec 决定，不影响这套通用协作骨架。图中的统一预算门同样应用于 Supervisor 和 Validator 等其他模型节点。
+关键点是将上下文按职责和依赖边界分散，而不是把多个 Agent 的内容重新拼回同一个大 Prompt。Supervisor 只管理 AgentSpec、DAG 和状态，Worker 不共享彼此历史，Reducer 只读取有界摘要。完整正文、代码文件或报告分段保存在模型窗口之外，最终由确定性程序拼接，因此最终输出总量可以大于任一 Agent 的单次输出，同时不会产生一个装入全部正文的大 Prompt。是否使用 RAG 只由具体 AgentSpec 决定，不影响这套通用协作骨架。
 
 ### 三条执行通道
 
@@ -217,6 +225,10 @@ Supervisor Context
 | `tools` | 本轮真正允许使用的工具白名单 |
 | `source_policy` | `none`、`optional` 或 `required`，决定是否依赖外部来源 |
 | `input_budget` | 该 Agent 独立64K窗口中的最大安全输入预算，默认61,000 Token |
+| `output_mode` | `finding` 表示供综合的结构化结果，`artifact` 表示必须保留的完整产物原文 |
+| `include_in_final` | 当前 Artifact 是否直接进入最终完整产物 |
+| `sequence` | 完整产物的确定性组装顺序 |
+| `target_characters` | 当前部分必须满足的最低字符数 |
 
 例如，代码设计问题可以生成“接口约束 Agent”“失败模式 Agent”“实现审阅 Agent”；运营规划问题则可以生成完全不同的职责。这些名称不是写死在代码中的模板。固定的是 Supervisor、Reducer、Validator、Finalizer 等控制职责，而不是业务执行角色。
 
@@ -233,6 +245,7 @@ External Memory
 ├── Child Chunks
 ├── Evidence Records
 ├── Agent Artifacts
+├── Full Deliverable Parts
 └── Graph Checkpoints and Validation State
 ```
 
@@ -269,6 +282,22 @@ Allocated Agents = min(Desired Agents, Max Agents)
 
 只有任务声明 `source_policy=required` 且获得 `source_search` 工具时，资料规模才会扩大 Agent 数；纯创作或普通推理不会因为后台仍索引着大文件而无意义地增加 Worker。对于需要完整扫描资料的任务，系统以约45K Token为目标划分连续分片，为输出和协议保留空间；如受最大 Agent 数限制导致某个 Evidence Pack 被截断，覆盖门禁会直接失败，而不会把不完整扫描伪装成成功。
 
+### 超长输出设置
+
+主界面的“运行设置”将逻辑 Agent 上限与公司 API 的瞬时并发分开控制。最大 Agent 数可以配置到128，但并行请求数最多16；例如设置100个正文 Agent、并行4个时，系统会分批完成100个独立调用，而不是同时向网关发出100个请求。
+
+| 设置 | 默认值 | 作用 |
+|---|---:|---|
+| 默认 Agent 数 | 3 | 小任务进入多 Agent 通道时的数量下限 |
+| 最大 Agent 数 | 16，可调至128 | 限制动态任务和完整产物分段的总数量 |
+| 并行请求数 | 4 | 限制同一时刻访问模型网关的请求数 |
+| 目标分段长度 | 1,200字符 | 根据目标总字数计算需要多少正文 Agent |
+| 单 Agent 最大输出 | 12,000 Token | 限制每个正文 Artifact 的生成上限 |
+| Reducer 扇入 | 4 | 普通综合任务每个归并节点接收的结果数 |
+| 最大重规划次数 | 1 | 字数不足或产物缺失时重试失败部分的次数 |
+
+若用户要求12万字、每段目标1,200字符，Supervisor 可建立100个正文任务。每个任务仍受独立64K窗口约束，正文 Artifact 在窗口外累计；最终12万字由程序拼接，不会再装入某个 Finalizer Prompt。配置面板会显示理论正文窗口池，例如126个正文 Agent × 12,000输出 Token约为151.2万 Token，是单次64K窗口的23倍以上。该数值表示编排容量上限，实际输出仍取决于明确的目标字数、模型能力和企业网关的单次输出限制。
+
 ### 任务依赖图
 
 Supervisor 除了生成 AgentSpec，还可以为任务声明 `depends_on`。程序只接受指向前序任务的依赖并计算 `phase`，从而形成无环任务图。每一波只并行执行当前所有依赖已经满足的任务；下游 Worker 接收上游结构化摘要，而不是上游完整上下文。
@@ -280,14 +309,17 @@ Phase 1: 章节 1 Agent  章节 2 Agent ... 章节 10 Agent
               └──────────────┬───────────────┘
 Phase 2: 连贯性与设定检查 Agent
                              │
-Phase 3: Tree Reducer + Validator + Finalizer
+Phase 3: Tree Reducer + Validator
+              │
+              ├─ 综合请求 → LLM Finalizer
+              └─ 完整产物 → 按章节顺序无损组装原文
 ```
 
 这使系统既能处理可并行的数据分片，也能处理有先后关系的创作、规划、编码和审查任务。
 
 ### 结构化事实账本与树形归并
 
-每个 Worker 不是只返回一段自由文本，而是返回 `facts`、`claims`、`uncertainties`、`contradictions` 和 `evidence_ids`。Reducer 先用程序确定性地合并这些账本字段，保证证据 ID、未解决项和冲突不会被一次 LLM 摘要静默删除；再使用固定扇入的树形 Reducer 进行语义归并：
+分析型 Worker 返回 `facts`、`claims`、`uncertainties`、`contradictions` 和 `evidence_ids`。完整产物 Worker 则直接返回正文或代码原文，同时生成一份有限摘要供调度、Reducer 和 Validator 使用。Reducer 永远不读取完整正文，只合并事实账本和摘要，因此它既不会因十章内容累积而突破窗口，也没有机会把正文压缩成“任务已完成”的概括。
 
 ```text
 Layer 0: A1  A2  A3  A4  A5  A6
@@ -303,7 +335,7 @@ Layer 2:          C1
 
 Validator 将确定性规则和语义判断分开处理。
 
-**硬规则验证**由程序执行，检查结构契约、必要字段、证据引用、任务状态、上下文预算、循环边界、全部分片是否扫描、必需对象是否解析，以及否定结论是否建立在完整覆盖之上。
+**硬规则验证**由程序执行，检查结构契约、必要字段、证据引用、任务状态、上下文预算、循环边界、全部分片是否扫描、必需对象是否解析，以及否定结论是否建立在完整覆盖之上。对于 `full_artifact`，还会检查应交付的部分数、顺序唯一性、每部分 Artifact 是否存在、每部分最低字符数和最终总字符数；未达到10000字时不能再显示“批准通过”。
 
 **语义验证**由模型执行，检查目标覆盖、证据支持、矛盾遗漏、不确定性表达、缺失对象和无依据的否定结论。
 

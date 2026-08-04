@@ -331,6 +331,112 @@ class MultiAgentContextTests(unittest.TestCase):
         self.assertEqual([task["phase"] for task in result.tasks], [0, 1, 2])
         self.assertTrue(result.validation["approved"])
 
+    def test_complete_deliverable_can_exceed_64k_without_being_summarized(self) -> None:
+        class FullArtifactModel:
+            last_usage = None
+
+            def __init__(self) -> None:
+                self.finalizer_called = False
+
+            def chat(self, messages, *, temperature=0.1, max_tokens=2_000):
+                del temperature, max_tokens
+                system = messages[0]["content"]
+                prompt = messages[-1]["content"]
+                if "ROLE:SUPERVISOR" in system:
+                    return json.dumps({
+                        "problem_type": "complete_report",
+                        "strategy": "先规划，再分段生成完整产物",
+                        "tasks": [{
+                            "objective": "规划报告结构",
+                            "query": "生成三部分报告结构",
+                            "agent_name": "当前报告结构 Agent",
+                            "agent_instruction": "形成三部分结构和衔接约束",
+                            "capabilities": ["structure"],
+                            "tools": ["model_reasoning"],
+                            "source_policy": "none",
+                            "priority": 100,
+                            "depends_on": [],
+                        }],
+                    }, ensure_ascii=False)
+                if "本次响应会被程序作为最终产物原文保存" in system:
+                    label = re.search(r"当前部分：([^\n]+)", prompt).group(1)
+                    index = int(re.search(r"第(\d+)部分", label).group(1))
+                    return f"## {label}\n\nPART-{index:03d}|" + "正文" * 650
+                if "ROLE:DYNAMIC_WORKER" in system:
+                    return json.dumps({
+                        "summary": "结构或审校任务已形成有效结果",
+                        "facts": [], "claims": [], "uncertainties": [],
+                        "contradictions": [], "evidence_ids": [], "confidence": 1.0,
+                    }, ensure_ascii=False)
+                if "ROLE:REDUCER" in system:
+                    return json.dumps({
+                        "summary": "只归并调度摘要，不接触完整正文",
+                        "claims": [], "evidence_ids": [],
+                    }, ensure_ascii=False)
+                if "ROLE:VALIDATOR" in system:
+                    hard_passed = json.loads(prompt)["hard_validation"]["passed"]
+                    return json.dumps({
+                        "semantic_pass": hard_passed,
+                        "missing_task_ids": [], "contradictions": [],
+                        "notes": "完整产物满足交付契约",
+                    }, ensure_ascii=False)
+                if "ROLE:FINALIZER" in system:
+                    self.finalizer_called = True
+                    return "错误：正文被概括"
+                raise AssertionError("unexpected role")
+
+        model = FullArtifactModel()
+        result = MultiAgentResearchSystem(
+            model, DocumentIndex(), default_agents=3, max_workers=110,
+            target_artifact_characters=1_200,
+        ).answer("请生成一份120000字、100部分的完整报告，不要概括，只输出全文。")
+        self.assertTrue(result.validation["approved"])
+        self.assertFalse(model.finalizer_called)
+        self.assertGreaterEqual(len(result.answer), 120_000)
+        self.assertIn("PART-001", result.answer)
+        self.assertIn("PART-050", result.answer)
+        self.assertIn("PART-100", result.answer)
+        self.assertNotIn("错误：正文被概括", result.answer)
+        report = result.context_metrics["deliverable_report"]
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["completed_parts"], 100)
+        self.assertGreater(report["actual_characters"], 64_000)
+        self.assertTrue(report["assembled_outside_model_window"])
+        self.assertFalse(report["summary_may_replace_deliverable"])
+        self.assertEqual(result.stop_reason, "validated_full_artifact")
+
+    def test_delivery_mode_follows_question_intent_and_explicit_user_preference(self) -> None:
+        system = MultiAgentResearchSystem(
+            DeterministicTestModel(), DocumentIndex(), default_agents=3, max_workers=16,
+        )
+
+        summary = system._infer_delivery_contract("请总结这部小说的人物关系。", "")
+        summary = system._resolve_delivery_contract(summary, {
+            "response_mode": "full_artifact", "artifact_type": "小说",
+        })
+        self.assertEqual(summary["response_mode"], "synthesis")
+        self.assertEqual(summary["decision_source"], "explicit_user_summary")
+
+        full = system._infer_delivery_contract("请写出完整小说全文，不要概括。", "")
+        full = system._resolve_delivery_contract(full, {"response_mode": "synthesis"})
+        self.assertEqual(full["response_mode"], "full_artifact")
+        self.assertEqual(full["decision_source"], "explicit_user_full")
+
+        automatic = system._infer_delivery_contract("为管理层准备季度复盘材料。", "")
+        automatic = system._resolve_delivery_contract(automatic, {
+            "response_mode": "full_artifact",
+            "artifact_type": "季度复盘报告",
+            "target_characters": 6000,
+            "target_parts": 4,
+        })
+        self.assertEqual(automatic["response_mode"], "full_artifact")
+        self.assertEqual(automatic["decision_source"], "dynamic_supervisor")
+        self.assertEqual(automatic["target_parts"], 4)
+
+        analysis = system._infer_delivery_contract("分析这部小说的叙事结构。", "")
+        analysis = system._resolve_delivery_contract(analysis, {"response_mode": "synthesis"})
+        self.assertEqual(analysis["response_mode"], "synthesis")
+
     def test_negative_claim_requires_complete_coverage(self) -> None:
         system = MultiAgentResearchSystem(DeterministicTestModel(), self.index)
         task = {

@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,7 +71,16 @@ class OpenAICompatibleClient:
 
     def __init__(self, settings: LLMSettings | None = None) -> None:
         self.settings = settings or LLMSettings.from_env()
-        self.last_usage: dict[str, int | str | None] | None = None
+        self._thread_state = threading.local()
+        self.supports_parallel_requests = True
+
+    @property
+    def last_usage(self) -> dict[str, int | str | None] | None:
+        return getattr(self._thread_state, "last_usage", None)
+
+    @last_usage.setter
+    def last_usage(self, value: dict[str, int | str | None] | None) -> None:
+        self._thread_state.last_usage = value
 
     def chat(
         self,

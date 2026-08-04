@@ -705,12 +705,20 @@ class ResearchApplication:
         max_workers = int(payload.get("max_workers", 8))
         default_agents = int(payload.get("default_agents", DEFAULT_AGENT_COUNT))
         reduce_fan_in = int(payload.get("reduce_fan_in", 4))
+        max_replans = int(payload.get("max_replans", 1))
+        parallel_workers = int(payload.get("parallel_workers", 4))
+        max_artifact_output_tokens = int(payload.get("max_artifact_output_tokens", 12_000))
+        target_artifact_characters = int(payload.get("target_artifact_characters", 1_200))
         system = MultiAgentResearchSystem(
             model,
             index,
             max_workers=max_workers,
             default_agents=default_agents,
             reduce_fan_in=reduce_fan_in,
+            max_replans=max_replans,
+            parallel_workers=parallel_workers,
+            max_artifact_output_tokens=max_artifact_output_tokens,
+            target_artifact_characters=target_artifact_characters,
             available_tools={
                 "model_reasoning",
                 *({"source_search"} if index.chunks else set()),
@@ -782,11 +790,15 @@ class ResearchApplication:
             "retrieval_strategies": metrics.get("retrieval_strategies", []),
             "dependency_phases": metrics.get("dependency_phases", 1),
             "coverage_report": metrics.get("coverage_report", {}),
+            "delivery_contract": metrics.get("delivery_contract", {}),
+            "deliverable_report": metrics.get("deliverable_report", {}),
             "token_accounting": metrics.get("token_accounting", {}),
+            "runtime_settings": metrics.get("runtime_settings", {}),
             "quality_gates": {
                 "capacity_passed": bool(metrics.get("all_agent_calls_within_limit", False)),
                 "coverage_passed": bool(metrics.get("coverage_report", {}).get("complete", True)),
                 "answer_passed": bool(result["validation"].get("approved", False)),
+                "deliverable_passed": bool(metrics.get("deliverable_report", {}).get("complete", True)),
             },
             "default_agents": allocation.get("default_agents", default_agents),
             "desired_agents": allocation.get("desired_agents", metrics["task_count"]),

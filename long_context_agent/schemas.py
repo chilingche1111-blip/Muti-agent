@@ -19,6 +19,11 @@ class TaskSpec:
     depends_on: tuple[str, ...] = ()
     phase: int = 0
     required_targets: tuple[str, ...] = ()
+    output_mode: str = "finding"
+    include_in_final: bool = False
+    sequence: int = 0
+    target_characters: int = 0
+    artifact_label: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +40,11 @@ class TaskSpec:
             "depends_on": list(self.depends_on),
             "phase": self.phase,
             "required_targets": list(self.required_targets),
+            "output_mode": self.output_mode,
+            "include_in_final": self.include_in_final,
+            "sequence": self.sequence,
+            "target_characters": self.target_characters,
+            "artifact_label": self.artifact_label,
         }
 
 
