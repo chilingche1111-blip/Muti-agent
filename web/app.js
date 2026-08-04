@@ -100,8 +100,12 @@ function compactResult(result) {
       shard_index: task.shard_index,
       shard_count: task.shard_count,
       shard_bytes: task.shard_bytes,
+      shard_tokens: task.shard_tokens,
       shard_chunks: task.shard_chunks,
       input_budget: task.input_budget,
+      depends_on: task.depends_on || [],
+      phase: task.phase || 0,
+      required_targets: task.required_targets || [],
     })),
     citations: (result.citations || []).slice(0, 40).map((citation) => ({
       ...citation,
@@ -405,9 +409,15 @@ function createAgentVisualization(result) {
   const fill = node("i"); fill.style.width = `${Math.min(100, allocated / Math.max(1, maximum) * 100)}%`; track.append(fill);
   capacity.append(capacityLabels, track);
 
+  const coverageMonitor = createCoverageMonitor(result);
+
   const pipeline = node("div", "agent-pipeline");
   const supervisor = node("div", "pipeline-node supervisor-node");
-  supervisor.append(node("span", "pipeline-node-index", "01"), node("strong", "", "Supervisor"), node("small", "", `规划 ${number(tasks.length)} 个隔离子任务`));
+  supervisor.append(
+    node("span", "pipeline-node-index", "01"),
+    node("strong", "", "Supervisor"),
+    node("small", "", `规划 ${number(tasks.length)} 个隔离子任务 · ${number(report.dependency_phases || 1)} 个依赖波次`),
+  );
   const firstArrow = node("div", "pipeline-arrow"); firstArrow.append(icon("M5 12h14m-5-5 5 5-5 5"));
 
   const agentStage = node("div", "agent-stage");
@@ -424,7 +434,7 @@ function createAgentVisualization(result) {
     const shardIndex = Number(task.shard_index || index + 1);
     const shardCount = Number(task.shard_count || tasks.length);
     const sourceLine = Number(task.shard_chunks || 0) > 0
-      ? `分片 ${number(shardIndex)} / ${number(shardCount)} · ${bytes(Number(task.shard_bytes || 0))} · ${number(task.shard_chunks)} 个资料块 · 独立 64K 窗口 / 安全输入 ${number(task.input_budget)} Token`
+      ? `分片 ${number(shardIndex)} / ${number(shardCount)} · ${bytes(Number(task.shard_bytes || 0))} · 约 ${number(task.shard_tokens)} Token · ${number(task.shard_chunks)} 个资料块 · 独立 64K 窗口 / 安全输入 ${number(task.input_budget)} Token`
       : `独立 64K 窗口 · 最大安全输入 ${number(task.input_budget)} Token`;
     const tools = (task.tools || []).join(" · ") || "model_reasoning";
     const capabilities = (task.capabilities || []).join(" · ") || "通用推理";
@@ -435,6 +445,7 @@ function createAgentVisualization(result) {
       node("p", "", sourceLine),
       node("small", "agent-tools", `能力：${capabilities}`),
       node("small", "agent-tools", `工具：${tools}`),
+      node("small", "agent-tools", `依赖：${(task.depends_on || []).join("、") || "无"} · 波次 ${number(Number(task.phase || 0) + 1)}`),
       node("span", "agent-complete", "已完成"),
     );
     grid.append(card);
@@ -449,11 +460,75 @@ function createAgentVisualization(result) {
   finish.append(reducer, validator);
   pipeline.append(supervisor, firstArrow, agentStage, secondArrow, finish);
 
-  section.append(head, metrics, capacity, pipeline);
+  section.append(head, metrics, capacity);
+  if (coverageMonitor) section.append(coverageMonitor);
+  section.append(pipeline);
   if (report.agent_strategy) section.append(node("p", "allocation-reason", `生成策略：${report.agent_strategy}`));
   if (report.agent_allocation_reason) section.append(node("p", "allocation-reason", `数量依据：${report.agent_allocation_reason}`));
   if (capped) section.append(node("p", "allocation-warning", `系统计算需要 ${number(desired)} 个 Agent，但配置上限为 ${number(maximum)}；建议提高最大 Agent 数或缩小单次任务范围。`));
   return section;
+}
+
+function createCoverageMonitor(result) {
+  const report = result.capacity_report || {};
+  const coverage = report.coverage_report || {};
+  const gates = report.quality_gates || {};
+  const accounting = report.token_accounting || {};
+  const hasCoverage = Boolean(coverage.required);
+  if (!hasCoverage && !Object.keys(gates).length) return null;
+
+  const panel = node("section", "coverage-monitor");
+  panel.setAttribute("aria-label", "覆盖率与质量门禁");
+  const head = node("div", "coverage-monitor-head");
+  const title = node("div");
+  title.append(node("span", "section-kicker", "Coverage & quality"), node("h4", "", "覆盖率与质量门禁"));
+  const percent = Number(coverage.coverage_percent ?? 100);
+  head.append(title, node("strong", coverage.complete === false ? "coverage-fail" : "coverage-pass", hasCoverage ? `${percent.toFixed(1)}%` : "无需资料"));
+
+  const gateGrid = node("div", "quality-gate-grid");
+  [
+    ["容量", gates.capacity_passed !== false, `${number(report.max_accounted_total_tokens || report.max_single_agent_prompt_tokens)} / ${number(report.context_limit_tokens || 64_000)} Token`],
+    ["覆盖", gates.coverage_passed !== false, hasCoverage ? `${number(coverage.covered_chunks)} / ${number(coverage.document_chunks)} 块` : "不需要来源"],
+    ["答案", gates.answer_passed !== false, result.validation?.approved ? "Validator 通过" : "Validator 拒绝"],
+  ].forEach(([label, passed, detail]) => {
+    const item = node("div", passed ? "gate-pass" : "gate-fail");
+    item.append(node("i", "", passed ? "✓" : "×"), node("span", "", label), node("strong", "", detail));
+    gateGrid.append(item);
+  });
+
+  panel.append(head, gateGrid);
+  if (hasCoverage) {
+    const strip = node("div", "coverage-shard-strip");
+    strip.setAttribute("role", "list");
+    strip.setAttribute("aria-label", `${coverage.total_shards || 0} 个资料分片的覆盖状态`);
+    (coverage.shards || []).forEach((shard) => {
+      const segment = node("div", shard.complete ? "complete" : "incomplete");
+      segment.setAttribute("role", "listitem");
+      segment.setAttribute("title", `分片 ${shard.shard_index}：${shard.scanned_chunks}/${shard.assigned_chunks} 块；约 ${number(shard.packed_tokens)} Token`);
+      segment.append(node("span", "", String(shard.shard_index)), node("small", "", shard.complete ? "完成" : "缺口"));
+      strip.append(segment);
+    });
+    panel.append(strip);
+  }
+
+  const targetList = node("div", "coverage-targets");
+  (coverage.targets || []).forEach((target) => {
+    const statusMap = {
+      resolved: ["已解决", "resolved"],
+      not_found_after_full_coverage: ["全覆盖未找到", "not-found"],
+      unresolved: ["候选存在但未回答", "unresolved"],
+      coverage_incomplete: ["覆盖不足", "unresolved"],
+    };
+    const [label, className] = statusMap[target.status] || [target.status || "未知", "unresolved"];
+    const item = node("div", className);
+    item.append(node("strong", "", target.target), node("span", "", `${label} · 候选 ${number(target.candidate_matches)}`));
+    targetList.append(item);
+  });
+  if (targetList.childElementCount) panel.append(targetList);
+
+  const tokenMode = accounting.mode === "api_usage" ? "API 实测" : (accounting.mode === "mixed" ? "API实测 + 估算" : "保守估算");
+  panel.append(node("p", "token-accounting-note", `Token 计量：${tokenMode} · 输出预留 ${number(accounting.output_reserve_tokens || 2_000)} · 安全余量 ${number(accounting.safety_margin_tokens || 1_000)}`));
+  return panel;
 }
 
 function createCitationSection(result, generalChat) {

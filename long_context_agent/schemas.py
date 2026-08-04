@@ -16,6 +16,9 @@ class TaskSpec:
     source_policy: str = "optional"
     priority: int = 50
     input_budget: int = 61_000
+    depends_on: tuple[str, ...] = ()
+    phase: int = 0
+    required_targets: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -29,6 +32,9 @@ class TaskSpec:
             "source_policy": self.source_policy,
             "priority": self.priority,
             "input_budget": self.input_budget,
+            "depends_on": list(self.depends_on),
+            "phase": self.phase,
+            "required_targets": list(self.required_targets),
         }
 
 

@@ -748,8 +748,13 @@ class ResearchApplication:
             "document_tokens_estimate": document_tokens,
             "document_exceeds_64k": document_tokens > 65_536,
             "max_single_agent_prompt_tokens": metrics["max_single_agent_prompt_tokens"],
+            "max_accounted_total_tokens": metrics.get("max_accounted_total_tokens", 0),
             "context_limit_tokens": metrics["context_limit_tokens"],
             "max_window_utilization_percent": metrics["max_window_utilization_percent"],
+            "max_total_window_utilization_percent": metrics.get(
+                "max_total_window_utilization_percent",
+                metrics["max_window_utilization_percent"],
+            ),
             "all_agent_calls_within_limit": metrics["all_agent_calls_within_limit"],
             "isolated_worker_contexts": metrics["isolated_worker_contexts"],
             "supervisor_received_raw_document": False,
@@ -765,6 +770,7 @@ class ResearchApplication:
                 )
                 and int(allocation.get("allocated_agents", 0)) > 1
                 and metrics["all_agent_calls_within_limit"]
+                and metrics.get("coverage_report", {}).get("complete", True)
                 and result["validation"].get("approved", False)
             ),
             "architecture": metrics["architecture"],
@@ -774,6 +780,14 @@ class ResearchApplication:
             "available_tools": metrics.get("available_tools", []),
             "structured_output_retries": metrics.get("structured_output_retries", 0),
             "retrieval_strategies": metrics.get("retrieval_strategies", []),
+            "dependency_phases": metrics.get("dependency_phases", 1),
+            "coverage_report": metrics.get("coverage_report", {}),
+            "token_accounting": metrics.get("token_accounting", {}),
+            "quality_gates": {
+                "capacity_passed": bool(metrics.get("all_agent_calls_within_limit", False)),
+                "coverage_passed": bool(metrics.get("coverage_report", {}).get("complete", True)),
+                "answer_passed": bool(result["validation"].get("approved", False)),
+            },
             "default_agents": allocation.get("default_agents", default_agents),
             "desired_agents": allocation.get("desired_agents", metrics["task_count"]),
             "allocated_agents": allocation.get("allocated_agents", metrics["task_count"]),
@@ -786,6 +800,10 @@ class ResearchApplication:
             "source_exceeds_shard_limit": allocation.get("source_exceeds_shard_limit", False),
             "multi_agent_sharding_active": allocation.get("multi_agent_sharding_active", False),
             "exhaustive_scan": allocation.get("exhaustive_scan", False),
+            "source_scaling_active": allocation.get("source_scaling_active", False),
+            "source_indexed_tokens": allocation.get("source_indexed_tokens", 0),
+            "target_shard_tokens": allocation.get("target_shard_tokens", 0),
+            "required_targets": allocation.get("required_targets", []),
         }
         return result
 
