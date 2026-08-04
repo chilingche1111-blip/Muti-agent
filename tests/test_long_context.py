@@ -28,7 +28,7 @@ class MultiAgentContextTests(unittest.TestCase):
     def test_generated_document_exceeds_64k_estimated_tokens(self) -> None:
         self.assertTrue(self.stats["exceeds_64k_estimated_tokens"])
 
-    def test_supervisor_splits_compound_goal_into_isolated_specialists(self) -> None:
+    def test_supervisor_generates_problem_specific_isolated_agents(self) -> None:
         result = MultiAgentResearchSystem(DeterministicTestModel(), self.index).answer(
             "请给出项目代号、验收口令和归档校验值。"
         )
@@ -36,10 +36,14 @@ class MultiAgentContextTests(unittest.TestCase):
         self.assertGreaterEqual(allocated, 3)
         self.assertEqual(len(result.tasks), allocated)
         self.assertEqual(len(result.findings), allocated)
-        self.assertEqual(sum(item["node"] == "fact_agent" for item in result.trace), allocated)
-        self.assertTrue(result.context_metrics["isolated_specialist_contexts"])
+        self.assertEqual(sum(item["node"] == "worker" for item in result.trace), allocated)
+        self.assertTrue(result.context_metrics["isolated_worker_contexts"])
+        self.assertTrue(all(item.get("agent_name") for item in result.tasks))
+        self.assertTrue(all(item.get("agent_instruction") for item in result.tasks))
+        self.assertTrue(all("agent_type" not in item for item in result.tasks))
         self.assertEqual(result.context_metrics["control_plane"], "deterministic_code")
         self.assertTrue(result.context_metrics["all_agent_calls_within_limit"])
+        self.assertTrue(all(call["role_budget"] == 61_000 for call in result.context_metrics["calls"]))
         self.assertIn("reducer", result.context_metrics["by_role"])
         self.assertTrue(result.validation["approved"])
         self.assertEqual(result.validation["decision_source"], "deterministic_policy")
@@ -49,15 +53,15 @@ class MultiAgentContextTests(unittest.TestCase):
         result = MultiAgentResearchSystem(DeterministicTestModel(), self.index).answer(
             "项目代号是什么？"
         )
-        self.assertEqual(result.context_metrics["planning_source"], "deterministic_router")
-        self.assertNotIn("supervisor", result.context_metrics["by_role"])
-        self.assertLess(result.context_metrics["max_single_agent_prompt_tokens"], 16_000)
+        self.assertEqual(result.context_metrics["planning_source"], "dynamic_model_supervisor")
+        self.assertIn("supervisor", result.context_metrics["by_role"])
+        self.assertLess(result.context_metrics["max_single_agent_prompt_tokens"], 61_000)
         self.assertGreater(self.stats["estimated_tokens"], 65_536)
 
     def test_summary_retrieval_covers_document_beginning_middle_and_end(self) -> None:
         system = MultiAgentResearchSystem(DeterministicTestModel(), self.index)
         result = system.answer("请总结全文的主要内容。")
-        self.assertEqual(result.context_metrics["intent"], "document_summary")
+        self.assertEqual(result.context_metrics["intent"], "offline_dynamic_plan")
         self.assertIn(
             "sharded_hybrid_plus_positional_coverage",
             result.context_metrics["retrieval_strategies"],
@@ -68,14 +72,14 @@ class MultiAgentContextTests(unittest.TestCase):
         self.assertLessEqual(cited_indices[0], 1)
         self.assertGreaterEqual(cited_indices[-1], len(self.index.chunks) - 2)
 
-    def test_invalid_specialist_json_is_repaired_once(self) -> None:
+    def test_invalid_dynamic_worker_json_is_repaired_once(self) -> None:
         class RepairableModel:
             def __init__(self) -> None:
                 self.delegate = DeterministicTestModel()
                 self.failed = False
 
             def chat(self, messages, *, temperature=0.1, max_tokens=2_000):
-                if "ROLE:SPECIALIST:" in messages[0]["content"] and not self.failed:
+                if "ROLE:DYNAMIC_WORKER" in messages[0]["content"] and not self.failed:
                     self.failed = True
                     return "not-json"
                 return self.delegate.chat(messages, temperature=temperature, max_tokens=max_tokens)
@@ -106,6 +110,7 @@ class MultiAgentContextTests(unittest.TestCase):
         self.assertEqual(allocation["default_agents"], 3)
         self.assertEqual(allocation["allocated_agents"], 3)
         self.assertEqual(len(result.tasks), 3)
+        self.assertTrue(all(task["input_budget"] == 61_000 for task in result.tasks))
         self.assertTrue(result.validation["approved"])
 
     def test_large_source_scales_agents_and_exposes_byte_metadata(self) -> None:
@@ -138,7 +143,22 @@ class MultiAgentContextTests(unittest.TestCase):
                 prompt = messages[-1]["content"]
                 employee_ids = list(dict.fromkeys(re.findall(r"EMP-\d{4}", prompt)))
                 evidence_ids = list(dict.fromkeys(re.findall(r"evidence_[a-f0-9]+", prompt)))
-                if "ROLE:SPECIALIST:" in system:
+                if "ROLE:SUPERVISOR" in system:
+                    return json.dumps({
+                        "problem_type": "employee_inventory",
+                        "strategy": "按资料规模动态扩展员工清单 Agent",
+                        "tasks": [{
+                            "objective": "完整列出所有员工编号",
+                            "query": "所有员工信息 完整清单",
+                            "agent_name": "员工清单覆盖 Agent",
+                            "agent_instruction": "扫描分配到的输入范围并保留全部员工编号。",
+                            "capabilities": ["完整扫描", "清单抽取"],
+                            "tools": ["model_reasoning", "source_search"],
+                            "source_policy": "required",
+                            "priority": 90,
+                        }],
+                    }, ensure_ascii=False)
+                if "ROLE:DYNAMIC_WORKER" in system:
                     return json.dumps({
                         "summary": "；".join(employee_ids),
                         "claims": employee_ids,
@@ -186,31 +206,89 @@ class MultiAgentContextTests(unittest.TestCase):
         self.assertIn("EMP-0060", result.answer)
         self.assertTrue(result.validation["approved"])
 
-    def test_main_agent_routes_to_allowed_professional_agent(self) -> None:
+    def test_main_agent_generates_problem_specific_agent_profile(self) -> None:
         result = MultiAgentResearchSystem(DeterministicTestModel(), self.index).answer(
             "请识别资料中的风险和矛盾。"
         )
-        self.assertEqual(result.tasks[0]["agent_type"], "risk_reviewer")
-        self.assertTrue(any(item["node"] == "risk_agent" for item in result.trace))
+        self.assertEqual(result.tasks[0]["agent_name"], "矛盾核查 Agent")
+        self.assertIn("自检", result.tasks[0]["capabilities"])
+        self.assertTrue(any(item["node"] == "worker" for item in result.trace))
+
+    def test_dynamic_agents_solve_general_problem_without_retrieval(self) -> None:
+        class GeneralProblemModel:
+            last_usage = None
+
+            def chat(self, messages, *, temperature=0.1, max_tokens=2_000):
+                del temperature, max_tokens
+                system = messages[0]["content"]
+                prompt = messages[-1]["content"]
+                if "ROLE:SUPERVISOR" in system:
+                    tasks = [
+                        {
+                            "objective": objective,
+                            "query": objective,
+                            "agent_name": name,
+                            "agent_instruction": instruction,
+                            "capabilities": capabilities,
+                            "tools": ["model_reasoning"],
+                            "source_policy": "none",
+                            "priority": priority,
+                        }
+                        for name, objective, instruction, capabilities, priority in (
+                            ("架构构思 Agent", "提出可维护的插件系统架构", "从模块边界和扩展点构造方案。", ["architecture_design"], 90),
+                            ("失效模式 Agent", "识别插件系统的主要失败模式", "从隔离、兼容性和恢复角度审查。", ["failure_analysis"], 85),
+                            ("落地计划 Agent", "形成分阶段实施计划", "把方案转换为可执行步骤。", ["implementation_planning"], 80),
+                        )
+                    ]
+                    return json.dumps({"problem_type": "software_design", "strategy": "并行设计、审查和落地", "tasks": tasks}, ensure_ascii=False)
+                if "ROLE:DYNAMIC_WORKER" in system:
+                    name = re.search(r"Agent 名称：([^。]+)", system).group(1)
+                    return json.dumps({"summary": f"{name}已完成独立分析", "claims": [f"{name}结论"], "evidence_ids": [], "confidence": 0.9}, ensure_ascii=False)
+                if "ROLE:REDUCER" in system:
+                    return json.dumps({"summary": "形成插件架构、失效防护和实施路线", "claims": ["分层插件接口", "故障隔离", "分阶段交付"], "evidence_ids": []}, ensure_ascii=False)
+                if "ROLE:VALIDATOR" in system:
+                    hard_passed = json.loads(prompt)["hard_validation"]["passed"]
+                    return json.dumps({"semantic_pass": hard_passed, "missing_task_ids": [], "contradictions": [], "notes": "通用任务覆盖完整"}, ensure_ascii=False)
+                if "ROLE:FINALIZER" in system:
+                    return "建议采用分层插件接口、故障隔离和分阶段交付。"
+                raise AssertionError("unexpected role")
+
+        result = MultiAgentResearchSystem(
+            GeneralProblemModel(),
+            DocumentIndex(),
+            default_agents=3,
+        ).answer("设计一个可扩展、可维护的插件系统，并给出风险和落地计划。")
+        self.assertTrue(result.validation["approved"])
+        self.assertEqual(len(result.tasks), 3)
+        self.assertTrue(all(task["source_policy"] == "none" for task in result.tasks))
+        self.assertTrue(all(task["tools"] == ["model_reasoning"] for task in result.tasks))
+        self.assertFalse(result.citations)
+        self.assertIn("分层插件接口", result.answer)
+        self.assertEqual(result.context_metrics["retrieval_strategies"], ["model_reasoning_only"])
 
     def test_validator_hard_checks_cannot_be_bypassed_by_model(self) -> None:
         system = MultiAgentResearchSystem(DeterministicTestModel(), self.index)
         hard = system._hard_validation(
-            [{"task_id": "task_01", "agent_type": "fact_extractor"}], [], {}
+            [{
+                "task_id": "task_01",
+                "agent_name": "临时核查 Agent",
+                "agent_instruction": "核查当前目标",
+                "source_policy": "required",
+            }], [], {}
         )
         self.assertFalse(hard["passed"])
         self.assertEqual(hard["missing_task_ids"], ["task_01"])
 
-    def test_role_budget_rejects_oversized_supervisor_input(self) -> None:
+    def test_full_window_budget_rejects_oversized_supervisor_input(self) -> None:
         with self.assertRaisesRegex(ValueError, "supervisor Agent 输入"):
-            MultiAgentResearchSystem(DeterministicTestModel(), self.index).answer("很长的问题" * 10_000)
+            MultiAgentResearchSystem(DeterministicTestModel(), self.index).answer("很长的问题" * 20_000)
 
     def test_full_offline_benchmark_passes(self) -> None:
         report = run_benchmark(self.document_path, self.cases_path, mode="offline")
         self.assertTrue(report["passed"])
         self.assertTrue(report["context_proof"]["divide_and_conquer_verified"])
         self.assertFalse(report["context_proof"]["supervisor_received_raw_document"])
-        self.assertTrue(report["context_proof"]["isolated_specialist_contexts"])
+        self.assertTrue(report["context_proof"]["isolated_worker_contexts"])
         self.assertEqual(report["context_proof"]["passed_cases"], 4)
         self.assertEqual(len(report["assertions"]), 6)
         self.assertTrue(all(item["passed"] for item in report["assertions"]))

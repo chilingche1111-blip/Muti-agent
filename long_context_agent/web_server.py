@@ -36,7 +36,7 @@ TEST_CASES = PROJECT_ROOT / "test_data" / "test_cases.json"
 MAX_REQUEST_BYTES = 30 * 1024 * 1024
 SESSION_COOKIE = "context_atlas_session"
 DIRECT_READ_PAGE_CHARACTERS = 12_000
-GENERAL_CHAT_INPUT_BUDGET = 24_000
+GENERAL_CHAT_INPUT_BUDGET = 61_000
 PAGE_RANGE_PATTERN = re.compile(
     r"(?:第\s*)?(\d{1,4})\s*(?:[-—–~～]|至|到)\s*(\d{1,4})\s*页|第\s*(\d{1,4})\s*页"
 )
@@ -195,7 +195,7 @@ class ResearchApplication:
             "estimated_tokens": estimate_tokens(parsed.text),
             "chunks": len(chunks),
             "sections": new_index.hierarchy_stats["parent_sections"],
-            "architecture": "LangGraph deterministic loop + Supervisor + Specialists + Validator",
+            "architecture": "LangGraph deterministic loop + Dynamic Agent Factory + Validator",
             "source_format": parsed.source_format,
             "parser_metadata": parsed.metadata,
             "exceeds_64kb_bytes": source_bytes > 65_536,
@@ -302,8 +302,7 @@ class ResearchApplication:
     def _looks_like_general_chat(question: str) -> bool:
         compact = re.sub(r"\s+", "", question.casefold())
         general_starts = (
-            "你好", "您好", "你是谁", "你能做什么", "谢谢", "帮我写", "写一段",
-            "翻译", "润色", "改写", "生成代码", "写代码", "解释一下",
+            "你好", "您好", "你是谁", "你能做什么", "谢谢", "感谢",
         )
         return compact.startswith(general_starts)
 
@@ -397,7 +396,11 @@ class ResearchApplication:
                 "task_id": "direct_chat_01",
                 "objective": question,
                 "query": question,
-                "agent_type": "general_llm",
+                "agent_name": "单模型助手",
+                "agent_instruction": "直接使用底层模型回答当前问题。",
+                "capabilities": ["general_reasoning"],
+                "tools": ["model_reasoning"],
+                "source_policy": "optional" if web_results else "none",
                 "priority": 100,
                 "input_budget": GENERAL_CHAT_INPUT_BUDGET,
             }],
@@ -431,10 +434,10 @@ class ResearchApplication:
                 "max_single_agent_prompt_tokens": measured,
                 "max_window_utilization_percent": round(measured / 64_000 * 100, 2),
                 "all_agent_calls_within_limit": measured + 5_000 <= 64_000,
-                "isolated_specialist_contexts": True,
+                "isolated_worker_contexts": True,
                 "supervisor_received_raw_document": False,
                 "task_count": 1,
-                "specialist_counts": {"general_llm": 1},
+                "dynamic_agent_counts": {"单模型助手": 1},
                 "model_calls": 1,
                 "planning_source": "direct_chat_router",
                 "intent": "general_chat",
@@ -461,10 +464,10 @@ class ResearchApplication:
                 "context_limit_tokens": 64_000,
                 "max_window_utilization_percent": round(measured / 64_000 * 100, 2),
                 "all_agent_calls_within_limit": measured + 5_000 <= 64_000,
-                "isolated_specialist_contexts": True,
+                "isolated_worker_contexts": True,
                 "supervisor_received_raw_document": False,
                 "task_count": 1,
-                "specialist_counts": {"general_llm": 1},
+                "dynamic_agent_counts": {"单模型助手": 1},
                 "control_plane": "direct_chat_router",
                 "model_calls": 1,
                 "divide_and_conquer_verified": False,
@@ -521,10 +524,10 @@ class ResearchApplication:
             "context_limit_tokens": 64_000,
             "max_window_utilization_percent": 0,
             "all_agent_calls_within_limit": True,
-            "isolated_specialist_contexts": True,
+            "isolated_worker_contexts": True,
             "supervisor_received_raw_document": False,
             "task_count": 1,
-            "specialist_counts": {"direct_document_reader": 1},
+            "dynamic_agent_counts": {"确定性原文读取器": 1},
             "control_plane": "deterministic_code",
             "model_calls": 0,
             "divide_and_conquer_verified": False,
@@ -558,7 +561,11 @@ class ResearchApplication:
                 "task_id": "direct_read_01",
                 "objective": question,
                 "query": "direct document content",
-                "agent_type": "direct_document_reader",
+                "agent_name": "确定性原文读取器",
+                "agent_instruction": "按字符范围直接返回解析文本，不调用模型。",
+                "capabilities": ["direct_source_read"],
+                "tools": ["source_reader"],
+                "source_policy": "required",
                 "priority": 100,
                 "input_budget": 0,
             }],
@@ -583,10 +590,10 @@ class ResearchApplication:
                 "max_single_agent_prompt_tokens": 0,
                 "max_window_utilization_percent": 0,
                 "all_agent_calls_within_limit": True,
-                "isolated_specialist_contexts": True,
+                "isolated_worker_contexts": True,
                 "supervisor_received_raw_document": False,
                 "task_count": 1,
-                "specialist_counts": {"direct_document_reader": 1},
+                "dynamic_agent_counts": {"确定性原文读取器": 1},
                 "model_calls": 0,
                 "by_role": {},
                 "calls": [],
@@ -611,7 +618,7 @@ class ResearchApplication:
             "estimated_tokens": tokens,
             "chunks": len(chunks),
             "sections": index.hierarchy_stats["parent_sections"],
-            "architecture": "LangGraph deterministic loop + Supervisor + Specialists + Validator",
+            "architecture": "LangGraph deterministic loop + Dynamic Agent Factory + Validator",
             "exceeds_64kb_bytes": len(text.encode("utf-8")) > 65_536,
             "exceeds_64k_tokens": tokens > 65_536,
         }
@@ -624,8 +631,8 @@ class ResearchApplication:
         if mode not in {"offline", "live"}:
             raise ValueError("运行模式必须是 offline 或 live。")
         scope = str(payload.get("answer_scope", "auto"))
-        if scope not in {"auto", "general", "document"}:
-            raise ValueError("回答范围必须是 auto、general 或 document。")
+        if scope not in {"auto", "general", "agent", "document"}:
+            raise ValueError("回答范围必须是 auto、general 或 agent。")
         with self.lock:
             has_document = bool(self.index.chunks)
             index = self.index
@@ -635,7 +642,7 @@ class ResearchApplication:
 
         resolved_scope = scope
         if scope == "auto":
-            resolved_scope = "general" if not has_document or self._looks_like_general_chat(question) else "document"
+            resolved_scope = "general" if self._looks_like_general_chat(question) else "agent"
         if resolved_scope == "general":
             if mode != "live":
                 raise ValueError("通用问答需要选择“智能回答”并配置真实 API；流程演示模型只用于架构验收。")
@@ -643,13 +650,13 @@ class ResearchApplication:
             web_results = search_web(question, limit=5) if payload.get("web_search") is True else []
             return self._general_chat(payload, question, client, web_results)
 
-        if not has_document:
-            raise ValueError("文档问答需要先导入 PDF、Word、PPT 或文本；也可以切换到“通用问答”。")
+        if resolved_scope == "document" and not has_document:
+            raise ValueError("文档约束模式需要先导入 PDF、Word、PPT 或文本。")
 
-        requested_pages = self._requested_page_range(question)
-        if requested_pages and self._is_page_content_request(question):
+        requested_pages = self._requested_page_range(question) if has_document else None
+        if has_document and requested_pages and self._is_page_content_request(question):
             return self._read_page_range(question, requested_pages)
-        if self._is_direct_read_request(question, payload):
+        if has_document and self._is_direct_read_request(question, payload):
             return self._read_document(payload, question)
 
         if payload.get("web_search") is True and mode != "live":
@@ -661,7 +668,7 @@ class ResearchApplication:
             if mode == "offline"
             else OpenAICompatibleClient(settings_from_payload(payload.get("api", {})))
         )
-        if requested_pages:
+        if requested_pages and has_document:
             page_text, _, _ = self._extract_pages(*requested_pages)
             page_index = DocumentIndex()
             page_index.add_text(
@@ -679,11 +686,12 @@ class ResearchApplication:
             index = page_index
         elif web_results:
             combined_index = DocumentIndex()
-            combined_index.add_text(
-                str(document.get("name") or "document"),
-                document_text,
-                source_bytes=int(document.get("bytes", len(document_text.encode("utf-8")))),
-            )
+            if has_document:
+                combined_index.add_text(
+                    str(document.get("name") or "document"),
+                    document_text,
+                    source_bytes=int(document.get("bytes", len(document_text.encode("utf-8")))),
+                )
             for position, item in enumerate(web_results, start=1):
                 web_text = f"# 联网来源 {position}\n\n标题：{item.title}\nURL：{item.url}\n摘要：{item.snippet}"
                 combined_index.add_text(
@@ -692,6 +700,8 @@ class ResearchApplication:
                     source_bytes=len(web_text.encode("utf-8")),
                 )
             index = combined_index
+        elif not has_document:
+            index = DocumentIndex()
         max_workers = int(payload.get("max_workers", 8))
         default_agents = int(payload.get("default_agents", DEFAULT_AGENT_COUNT))
         reduce_fan_in = int(payload.get("reduce_fan_in", 4))
@@ -701,9 +711,14 @@ class ResearchApplication:
             max_workers=max_workers,
             default_agents=default_agents,
             reduce_fan_in=reduce_fan_in,
+            available_tools={
+                "model_reasoning",
+                *({"source_search"} if index.chunks else set()),
+                *({"web_sources"} if web_results else set()),
+            },
         )
         result = asdict(system.answer(question, conversation_context=conversation_context))
-        result["execution_mode"] = "offline_demo" if mode == "offline" else "live_multi_agent"
+        result["execution_mode"] = "offline_demo" if mode == "offline" else "live_dynamic_agents"
         result["web_sources"] = [item.as_dict() for item in web_results]
         if web_results:
             result["citations"].extend({
@@ -736,10 +751,11 @@ class ResearchApplication:
             "context_limit_tokens": metrics["context_limit_tokens"],
             "max_window_utilization_percent": metrics["max_window_utilization_percent"],
             "all_agent_calls_within_limit": metrics["all_agent_calls_within_limit"],
-            "isolated_specialist_contexts": metrics["isolated_specialist_contexts"],
+            "isolated_worker_contexts": metrics["isolated_worker_contexts"],
             "supervisor_received_raw_document": False,
             "task_count": metrics["task_count"],
-            "specialist_counts": metrics["specialist_counts"],
+            "dynamic_agent_counts": metrics["dynamic_agent_counts"],
+            "generated_agent_profiles": metrics["generated_agent_profiles"],
             "control_plane": metrics["control_plane"],
             "model_calls": metrics["model_calls"],
             "divide_and_conquer_verified": (
@@ -754,6 +770,8 @@ class ResearchApplication:
             "architecture": metrics["architecture"],
             "planning_source": metrics.get("planning_source"),
             "intent": metrics.get("intent"),
+            "agent_strategy": metrics.get("agent_strategy", ""),
+            "available_tools": metrics.get("available_tools", []),
             "structured_output_retries": metrics.get("structured_output_retries", 0),
             "retrieval_strategies": metrics.get("retrieval_strategies", []),
             "default_agents": allocation.get("default_agents", default_agents),

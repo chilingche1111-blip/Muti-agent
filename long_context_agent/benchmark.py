@@ -33,15 +33,56 @@ class DeterministicTestModel:
         prompt = messages[-1]["content"]
         if "ROLE:SUPERVISOR" in system:
             tasks = [
-                {"objective": f"查明{label}", "query": label, "agent_type": "fact_extractor", "priority": 80}
+                {
+                    "objective": f"查明{label}",
+                    "query": label,
+                    "agent_name": f"{label}定位 Agent",
+                    "agent_instruction": f"在可用资料中定位并核对{label}，保留证据标识。",
+                    "capabilities": ["精确定位", "字段核对"],
+                    "tools": ["model_reasoning", "source_search"],
+                    "source_policy": "required",
+                    "priority": 80,
+                }
                 for label, value in self.FACTS.items()
                 if label in prompt or value in prompt
             ]
             if not tasks:
-                agent_type = "risk_reviewer" if "风险" in prompt or "矛盾" in prompt else "comparator" if "比较" in prompt else "analyst" if "总结" in prompt or "分析" in prompt else "fact_extractor"
-                tasks = [{"objective": prompt, "query": prompt, "agent_type": agent_type, "priority": 50}]
-            return json.dumps({"tasks": tasks}, ensure_ascii=False)
-        if "ROLE:SPECIALIST:" in system:
+                if "总结" in prompt or "概括" in prompt:
+                    tasks = [
+                        {
+                            "objective": objective,
+                            "query": query,
+                            "agent_name": name,
+                            "agent_instruction": instruction,
+                            "capabilities": ["内容归纳", "位置覆盖"],
+                            "tools": ["model_reasoning", "source_search"],
+                            "source_policy": "required",
+                            "priority": priority,
+                        }
+                        for objective, query, name, instruction, priority in (
+                            ("概括资料开头", "背景 目标 范围 文档开头", "开篇脉络 Agent", "提炼开头的背景、目标和范围。", 90),
+                            ("概括资料中部", "核心内容 主要信息", "核心内容 Agent", "归纳资料中部的核心内容。", 85),
+                            ("概括资料末尾", "结论 行动项 限制 文档末尾", "结论收束 Agent", "提炼末尾结论、限制与行动项。", 80),
+                        )
+                    ]
+                else:
+                    name = (
+                        "矛盾核查 Agent" if "风险" in prompt or "矛盾" in prompt
+                        else "差异建模 Agent" if "比较" in prompt
+                        else "问题求解 Agent"
+                    )
+                    tasks = [{
+                        "objective": prompt,
+                        "query": prompt,
+                        "agent_name": name,
+                        "agent_instruction": "根据当前问题独立构造解法，并检查结论是否完整。",
+                        "capabilities": ["问题分解", "自检"],
+                        "tools": ["model_reasoning", "source_search"],
+                        "source_policy": "required" if '"available": true' in prompt else "none",
+                        "priority": 50,
+                    }]
+            return json.dumps({"problem_type": "offline_dynamic_plan", "strategy": "按问题即时生成执行 Agent", "tasks": tasks}, ensure_ascii=False)
+        if "ROLE:DYNAMIC_WORKER" in system:
             ids = re.findall(r"\[artifact_id=([^\]]+)\]", prompt)
             found = [value for value in self.FACTS.values() if value in prompt]
             return json.dumps({"summary": "；".join(found) if found else "未找到测试事实", "claims": found, "evidence_ids": ids[:3], "confidence": 1.0 if found else 0.2}, ensure_ascii=False)
@@ -63,7 +104,7 @@ HARD_CHECK_LABELS = {
     "unique_task_ids": "任务 ID 不唯一或为空",
     "all_tasks_have_findings": "至少一个子任务没有形成有效结论或证据",
     "artifacts_and_evidence_valid": "Finding 或 Evidence Artifact 无效",
-    "reducer_evidence_closed": "Reducer 引入了专业 Agent 未提供的证据",
+    "reducer_evidence_closed": "Reducer 引入了动态 Agent 未提供的证据",
     "all_calls_within_context_limit": "至少一次 Agent 调用超过上下文安全预算",
 }
 
@@ -99,7 +140,7 @@ def explain_case_failure(result: dict[str, Any], missing_terms: list[str]) -> li
     if hard.get("missing_task_ids"):
         reasons.append({
             "code": "missing_task_findings",
-            "stage": "Specialists",
+            "stage": "Dynamic Workers",
             "message": f"缺少任务结果：{', '.join(hard['missing_task_ids'])}",
             "retryable": True,
         })
@@ -193,8 +234,8 @@ def run_benchmark(
     assertions = [
         {"id": "document_over_window", "label": "测试资料超过 64K", "passed": document_tokens > 65_536, "actual": f"{document_tokens} Token", "expected": "> 65,536 Token"},
         {"id": "calls_under_window", "label": "每次 Agent 调用低于 64K", "passed": all_within, "actual": f"最大 {max_prompt} Token", "expected": "输入 + 预留 + 余量 ≤ 64K"},
-        {"id": "specialist_isolation", "label": "专业 Agent 上下文相互隔离", "passed": all(item["context_metrics"]["isolated_specialist_contexts"] for item in results), "actual": "独立 Specialist State", "expected": "不得共享消息历史"},
-        {"id": "supervisor_no_raw", "label": "主 Agent 不接收完整原文", "passed": all(not item["context_metrics"]["supervisor_received_raw_document"] for item in results), "actual": "仅接收任务状态", "expected": "原文保留在检索层"},
+        {"id": "worker_isolation", "label": "动态 Agent 上下文相互隔离", "passed": all(item["context_metrics"]["isolated_worker_contexts"] for item in results), "actual": "独立 Dynamic Worker State", "expected": "不得共享消息历史"},
+        {"id": "supervisor_no_raw", "label": "主 Agent 不接收完整原文", "passed": all(not item["context_metrics"]["supervisor_received_raw_document"] for item in results), "actual": "仅接收任务状态", "expected": "原文保存在窗口外资料层"},
         {"id": "validator_approved", "label": "Validator 双层验证通过", "passed": all_validated, "actual": f"{sum(item['validation'].get('approved', False) for item in results)} / {len(results)}", "expected": "硬校验且语义校验通过"},
         {"id": "cases_and_citations", "label": "全部用例正确且带引用", "passed": all_passed and all_cited, "actual": f"{sum(item['passed'] for item in results)} / {len(results)}", "expected": "所有预期事实可追溯"},
     ]
@@ -230,14 +271,14 @@ def run_benchmark(
             "physical_context_limit_tokens": 64_000,
             "max_single_agent_prompt_tokens": max_prompt,
             "all_agent_calls_within_limit": all_within,
-            "isolated_specialist_contexts": True,
+            "isolated_worker_contexts": True,
             "supervisor_received_raw_document": False,
             "passed_cases": sum(item["passed"] for item in results),
             "total_cases": len(results),
             "divide_and_conquer_verified": document_tokens > 65_536 and all_within and all_passed,
-            "architecture": "LangGraph deterministic loop + Supervisor + Specialists + Validator",
+            "architecture": "LangGraph deterministic loop + Dynamic Agent Factory + Validator",
         },
-        "interpretation": "该测试验证确定性外循环把长资料任务路由给独立专业Agent，主Agent不接收原文，Validator执行硬校验与语义校验，且每次调用均低于64K；它不代表底层模型窗口被修改。",
+        "interpretation": "该测试验证确定性外循环会根据问题生成隔离的动态 Agent，外部资料只作为可选能力进入有界上下文，Validator执行硬校验与语义校验，且每次调用均低于64K；它不代表底层模型窗口被修改。",
     }
 
 

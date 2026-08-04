@@ -25,20 +25,8 @@ DEFAULT_AGENT_COUNT = 3
 SOURCE_SHARD_BYTE_LIMIT = 64 * 1024
 TARGET_CHUNKS_PER_AGENT = 128
 EXHAUSTIVE_SCAN_TERMS = ("全部", "所有", "完整清单", "逐条", "逐项", "员工信息", "员工名单")
-
-SPECIALIST_NODE_MAP = {
-    "fact_extractor": "fact_agent",
-    "analyst": "analysis_agent",
-    "risk_reviewer": "risk_agent",
-    "comparator": "comparison_agent",
-}
-
-SPECIALIST_INSTRUCTIONS = {
-    "fact_extractor": "精确抽取事实、数值、名称和原文条件；不做无证据推断。",
-    "analyst": "只在当前子任务证据范围内归纳主题、原因和影响；明确区分事实与判断。",
-    "risk_reviewer": "识别风险、矛盾、缺口和需要复核之处；保留相互冲突的证据。",
-    "comparator": "按任务指定维度进行结构化比较；缺失维度必须明确标记未知。",
-}
+SOURCE_POLICIES = {"none", "optional", "required"}
+BUILTIN_TOOLS = {"model_reasoning", "source_search", "web_sources"}
 
 
 class ChatModel(Protocol):
@@ -67,7 +55,7 @@ class GraphState(TypedDict, total=False):
     agent_allocation: dict[str, Any]
 
 
-class SpecialistState(TypedDict):
+class DynamicWorkerState(TypedDict):
     question: str
     task: dict[str, Any]
 
@@ -89,17 +77,14 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
 
 
 class MultiAgentResearchSystem:
-    """Deterministic LangGraph outer loop with centrally scheduled specialists."""
+    """Deterministic LangGraph outer loop with runtime-generated Worker agents."""
 
     ROLE_BUDGETS = {
-        "supervisor": 8_000,
-        "fact_extractor": 12_000,
-        "analyst": 16_000,
-        "risk_reviewer": 14_000,
-        "comparator": 16_000,
-        "reducer": 16_000,
-        "validator": 10_000,
-        "finalizer": 20_000,
+        "supervisor": MODEL_CONTEXT_LIMIT,
+        "worker": MODEL_CONTEXT_LIMIT,
+        "reducer": MODEL_CONTEXT_LIMIT,
+        "validator": MODEL_CONTEXT_LIMIT,
+        "finalizer": MODEL_CONTEXT_LIMIT,
     }
 
     def __init__(
@@ -114,13 +99,14 @@ class MultiAgentResearchSystem:
         shard_byte_limit: int = SOURCE_SHARD_BYTE_LIMIT,
         reduce_fan_in: int = 4,
         max_replans: int = 1,
+        available_tools: set[str] | None = None,
     ) -> None:
         if context_limit < 8_000:
             raise ValueError("模型上下文上限不能低于 8,000 Token")
         if max_workers < 1 or max_workers > 32:
             raise ValueError("专业子 Agent 数量必须在 1至32 之间")
         if default_agents < 1 or default_agents > 32:
-            raise ValueError("默认专业 Agent 数量必须在 1至32 之间")
+            raise ValueError("默认动态 Agent 数量必须在 1至32 之间")
         if shard_byte_limit < 16 * 1024 or shard_byte_limit > 4 * 1024 * 1024:
             raise ValueError("单 Agent 分片阈值必须在 16 KB至4 MB 之间")
         if reduce_fan_in < 2 or reduce_fan_in > 8:
@@ -136,6 +122,15 @@ class MultiAgentResearchSystem:
         self.shard_byte_limit = shard_byte_limit
         self.reduce_fan_in = reduce_fan_in
         self.max_replans = max_replans
+        inferred_tools = {"model_reasoning"}
+        if self.index.chunks:
+            inferred_tools.add("source_search")
+        self.available_tools = (
+            {str(item) for item in available_tools if str(item) in BUILTIN_TOOLS}
+            if available_tools is not None
+            else inferred_tools
+        )
+        self.available_tools.add("model_reasoning")
         self._model_lock = threading.RLock()
         self._record_lock = threading.RLock()
         self._calls: list[dict[str, Any]] = []
@@ -144,27 +139,22 @@ class MultiAgentResearchSystem:
         self._intent = "unknown"
         self._retrieval_strategies: set[str] = set()
         self._allocation: dict[str, Any] = {}
+        self._agent_strategy = ""
         self._conversation_context = ""
         self._graph = self._build_graph()
 
     def _build_graph(self):
         graph = StateGraph(GraphState)
         graph.add_node("supervisor", self._supervisor)
-        graph.add_node("fact_agent", self._fact_agent)
-        graph.add_node("analysis_agent", self._analysis_agent)
-        graph.add_node("risk_agent", self._risk_agent)
-        graph.add_node("comparison_agent", self._comparison_agent)
+        graph.add_node("worker", self._dynamic_worker)
         graph.add_node("reducer", self._reduce_tree)
         graph.add_node("validator", self._validator)
         graph.add_node("supervisor_replan", self._supervisor_replan)
         graph.add_node("finalizer", self._finalize)
 
         graph.add_edge(START, "supervisor")
-        graph.add_conditional_edges(
-            "supervisor", self._dispatch_active_tasks, list(SPECIALIST_NODE_MAP.values())
-        )
-        for node in SPECIALIST_NODE_MAP.values():
-            graph.add_edge(node, "reducer")
+        graph.add_conditional_edges("supervisor", self._dispatch_active_tasks, ["worker"])
+        graph.add_edge("worker", "reducer")
         graph.add_edge("reducer", "validator")
         graph.add_conditional_edges(
             "validator",
@@ -174,7 +164,7 @@ class MultiAgentResearchSystem:
         graph.add_conditional_edges(
             "supervisor_replan",
             self._dispatch_after_replan,
-            [*SPECIALIST_NODE_MAP.values(), "finalizer"],
+            ["worker", "finalizer"],
         )
         graph.add_edge("finalizer", END)
         return graph.compile(checkpointer=MemorySaver())
@@ -188,6 +178,7 @@ class MultiAgentResearchSystem:
         self._intent = "unknown"
         self._retrieval_strategies = set()
         self._allocation = {}
+        self._agent_strategy = ""
         self._conversation_context = str(conversation_context).strip()[:6_000]
         self.artifacts.clear()
         state = self._graph.invoke(
@@ -218,46 +209,56 @@ class MultiAgentResearchSystem:
 
     def _supervisor(self, state: GraphState) -> dict[str, Any]:
         question = state["question"]
-        controlled_tasks, intent = self._controlled_plan(question)
-        if controlled_tasks is None:
-            allowed = ", ".join(SPECIALIST_NODE_MAP)
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "ROLE:SUPERVISOR。你是唯一的任务规划与调度 Agent，不读取完整原文。"
-                        "按用户目标拆成最少且互不重叠的任务；简单目标只生成一项。"
-                        "你只输出任务计划，不能决定图跳转、循环次数或结束条件。"
-                        "返回JSON：{\"tasks\":[{\"objective\":...,\"query\":...,"
-                        "\"agent_type\":...,\"priority\":1到100}]}。"
-                        f"agent_type只允许：{allowed}。最多{self.max_workers}项。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        (
-                            f"有界对话记忆（仅用于消解指代，不视为文档证据）：\n"
-                            f"{self._conversation_context}\n\n"
-                        )
+        source_stats = {
+            "available": bool(self.index.chunks),
+            "chunks": len(self.index.chunks),
+            "indexed_bytes": self.index.total_indexed_bytes,
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "ROLE:SUPERVISOR。你是动态 Agent 设计器和任务调度器。"
+                    "不要从固定角色列表中选择 Agent；必须根据当前问题即时生成每个执行 Agent 的名称、"
+                    "任务指令、能力和工具。不同任务可以生成完全不同的 Agent。"
+                    "你不读取完整资料，只接收问题、对话摘要、可用工具和资料规模元数据。"
+                    "将目标拆成边界清晰、可独立验证的子任务；只规划，不决定流程跳转或循环次数。"
+                    "tools 只能使用本次明确提供的工具；capabilities 可以按问题自由命名。"
+                    "source_policy 只能是 none、optional、required：不需要外部资料、可选参考资料、"
+                    "或结论必须由外部资料支持。"
+                    "返回JSON：{\"problem_type\":...,\"strategy\":...,\"tasks\":[{"
+                    "\"objective\":...,\"query\":...,\"agent_name\":...,"
+                    "\"agent_instruction\":...,\"capabilities\":[...],\"tools\":[...],"
+                    "\"source_policy\":...,\"priority\":1到100}]}。"
+                    f"最多{self.max_workers}项。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"可用工具：{json.dumps(sorted(self.available_tools), ensure_ascii=False)}\n"
+                    f"资料元数据：{json.dumps(source_stats, ensure_ascii=False)}\n"
+                    f"默认并行下限：{self.default_agents}\n"
+                    + (
+                        f"有界对话记忆（仅用于理解指代）：\n{self._conversation_context}\n"
                         if self._conversation_context else ""
-                    ) + f"研究目标：{question}",
-                },
-            ]
-            parsed, _ = self._call_json(
-                "supervisor", messages, max_tokens=1_500, required_keys=("tasks",)
-            )
-            tasks = self._normalize_tasks(parsed.get("tasks"), question)
-            planning_source = "model_supervisor"
-        else:
-            tasks = self._normalize_tasks(controlled_tasks, question)
-            planning_source = "deterministic_router"
+                    )
+                    + f"用户目标：{question}"
+                ),
+            },
+        ]
+        parsed, _ = self._call_json(
+            "supervisor", messages, max_tokens=2_000, required_keys=("tasks",)
+        )
+        tasks = self._normalize_tasks(parsed.get("tasks"), question)
+        planning_source = "dynamic_model_supervisor"
+        intent = str(parsed.get("problem_type") or "general_problem")[:120]
+        strategy = str(parsed.get("strategy") or "动态生成执行 Agent 并按子任务并行求解")[:500]
         tasks = self._allocate_agent_tasks(tasks, question)
         self._planning_source = planning_source
         self._intent = intent
-        role_counts: dict[str, int] = {}
-        for task in tasks:
-            role_counts[task["agent_type"]] = role_counts.get(task["agent_type"], 0) + 1
+        self._agent_strategy = strategy
+        generated_names = list(dict.fromkeys(task["agent_name"] for task in tasks))
         return {
             "tasks": tasks,
             "active_tasks": tasks,
@@ -270,69 +271,14 @@ class MultiAgentResearchSystem:
                 "role": "主 Agent",
                 "status": "scheduled",
                 "detail": (
-                    f"识别意图={intent}；规划来源={planning_source}；"
-                    f"生成并校验 {len(tasks)} 个分片任务；自动分配 {self._allocation.get('allocated_agents', len(tasks))} 个 Agent；"
-                    f"专业分配 {role_counts}"
+                    f"问题类型={intent}；策略={strategy}；"
+                    f"运行时生成 {len(generated_names)} 种 Agent 规格，"
+                    f"分配 {self._allocation.get('allocated_agents', len(tasks))} 个隔离实例"
                 ),
                 "task_ids": [task["task_id"] for task in tasks],
+                "generated_agents": generated_names,
             }],
         }
-
-    def _controlled_plan(self, question: str) -> tuple[list[dict[str, Any]] | None, str]:
-        """Use deterministic routing where intent is clear; defer compound goals to the LLM."""
-        compact = re.sub(r"\s+", "", question.casefold())
-        compound_terms = ("同时", "分别", "逐项", "以及", "并且", "、", "；")
-        if any(term in compact for term in compound_terms):
-            return None, "compound_research"
-        if any(term in compact for term in ("比较", "对比", "差异", "异同")):
-            return [{
-                "objective": question,
-                "query": question,
-                "agent_type": "comparator",
-                "priority": 90,
-            }], "comparison"
-        if any(term in compact for term in ("风险", "矛盾", "冲突", "缺口", "核实", "审查")):
-            return [{
-                "objective": question,
-                "query": question,
-                "agent_type": "risk_reviewer",
-                "priority": 90,
-            }], "risk_review"
-        if any(term in compact for term in ("总结", "概括", "主要内容", "全文要点", "核心内容")):
-            summary_tasks = [
-                {
-                    "objective": "概括文档开头的背景、目标与范围",
-                    "query": "背景 目标 范围 文档开头",
-                    "agent_type": "analyst",
-                    "priority": 90,
-                },
-                {
-                    "objective": f"归纳文档核心内容并回答：{question}",
-                    "query": question,
-                    "agent_type": "analyst",
-                    "priority": 85,
-                },
-                {
-                    "objective": "检查文档末尾的结论、行动项、限制与风险",
-                    "query": "结论 行动项 限制 风险 文档末尾",
-                    "agent_type": "analyst",
-                    "priority": 80,
-                },
-            ]
-            if self.max_workers == 1:
-                return [summary_tasks[1]], "document_summary"
-            if self.max_workers == 2:
-                return [summary_tasks[0], summary_tasks[2]], "document_summary"
-            return summary_tasks, "document_summary"
-        fact_pattern = re.compile(r"(是什么|有哪些|多少|哪[个些]?|谁|何时|何地|是否|提取|查找|找出)")
-        if fact_pattern.search(compact):
-            return [{
-                "objective": question,
-                "query": question,
-                "agent_type": "fact_extractor",
-                "priority": 90,
-            }], "fact_lookup"
-        return None, "open_research"
 
     def _normalize_tasks(self, raw_tasks: Any, question: str) -> list[dict[str, Any]]:
         tasks: list[TaskSpec] = []
@@ -343,9 +289,22 @@ class MultiAgentResearchSystem:
                     break
                 objective = str(raw.get("objective", "")).strip()[:500]
                 query = str(raw.get("query", objective)).strip()[:500]
-                agent_type = str(raw.get("agent_type", "fact_extractor")).strip()
-                if agent_type not in SPECIALIST_NODE_MAP:
-                    agent_type = self._infer_agent_type(objective)
+                agent_name = str(raw.get("agent_name") or f"{objective[:24]} Agent").strip()[:80]
+                instruction = str(raw.get("agent_instruction") or (
+                    f"独立完成子任务：{objective}。说明采用的推理依据并返回结构化结论。"
+                )).strip()[:1_000]
+                capabilities = self._string_list(raw.get("capabilities"), fallback=("reasoning",))
+                requested_tools = self._string_list(raw.get("tools"), fallback=("model_reasoning",))
+                tools = tuple(item for item in requested_tools if item in self.available_tools)
+                if "model_reasoning" not in tools:
+                    tools = ("model_reasoning", *tools)
+                source_policy = str(raw.get("source_policy", "optional")).strip().casefold()
+                if source_policy not in SOURCE_POLICIES:
+                    source_policy = "optional"
+                if source_policy != "none" and "source_search" in self.available_tools and self.index.chunks:
+                    tools = tuple(dict.fromkeys((*tools, "source_search")))
+                if not self.index.chunks:
+                    source_policy = "none"
                 key = (objective.casefold(), query.casefold())
                 if not objective or not query or key in seen:
                     continue
@@ -358,20 +317,40 @@ class MultiAgentResearchSystem:
                     task_id=f"task_{len(tasks) + 1:02d}",
                     objective=objective,
                     query=query,
-                    agent_type=agent_type,
+                    agent_name=agent_name,
+                    agent_instruction=instruction,
+                    capabilities=capabilities,
+                    tools=tools,
+                    source_policy=source_policy,
                     priority=priority,
-                    input_budget=min(16_000, self.ROLE_BUDGETS[agent_type]),
+                    input_budget=min(
+                        self.ROLE_BUDGETS["worker"],
+                        self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN,
+                    ),
                 ))
         if not tasks:
-            agent_type = self._infer_agent_type(question)
             tasks = [TaskSpec(
                 task_id="task_01",
                 objective=question[:500],
                 query=question[:500],
-                agent_type=agent_type,
-                input_budget=min(16_000, self.ROLE_BUDGETS[agent_type]),
+                agent_name="问题求解 Agent",
+                agent_instruction=f"独立分析并解决用户问题：{question[:500]}",
+                capabilities=("reasoning", "self_check"),
+                tools=tuple(sorted(self.available_tools)),
+                source_policy="optional" if self.index.chunks else "none",
+                input_budget=min(
+                    self.ROLE_BUDGETS["worker"],
+                    self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN,
+                ),
             )]
         return [task.as_dict() for task in sorted(tasks, key=lambda item: -item.priority)]
+
+    @staticmethod
+    def _string_list(value: Any, *, fallback: tuple[str, ...]) -> tuple[str, ...]:
+        if not isinstance(value, list):
+            return fallback
+        cleaned = tuple(dict.fromkeys(str(item).strip()[:80] for item in value if str(item).strip()))
+        return cleaned[:8] or fallback
 
     def _allocate_agent_tasks(
         self,
@@ -432,7 +411,7 @@ class MultiAgentResearchSystem:
                 "task_id": f"task_{slot + 1:02d}",
                 "base_task_id": template.get("task_id", ""),
                 "query": combined_query[:1_000],
-                "agent_instance_id": f"{template.get('agent_type', 'worker')}_{slot + 1:02d}",
+                "agent_instance_id": f"dynamic_worker_{slot + 1:02d}",
                 "shard_index": slot + 1,
                 "shard_count": allocated,
                 "chunk_start": chunk_start,
@@ -459,43 +438,20 @@ class MultiAgentResearchSystem:
         return allocated_tasks
 
     @staticmethod
-    def _infer_agent_type(text: str) -> str:
-        compact = text.casefold()
-        if any(term in compact for term in ("风险", "矛盾", "缺口", "核实", "审查")):
-            return "risk_reviewer"
-        if any(term in compact for term in ("比较", "对比", "差异", "异同")):
-            return "comparator"
-        if any(term in compact for term in ("分析", "总结", "归纳", "原因", "影响")):
-            return "analyst"
-        return "fact_extractor"
-
-    @staticmethod
     def _dispatch_active_tasks(state: GraphState):
         return [
-            Send(SPECIALIST_NODE_MAP[task["agent_type"]], {"question": state["question"], "task": task})
+            Send("worker", {"question": state["question"], "task": task})
             for task in state.get("active_tasks", [])
         ]
 
-    def _fact_agent(self, state: SpecialistState) -> dict[str, Any]:
-        return self._run_specialist(state, "fact_extractor")
-
-    def _analysis_agent(self, state: SpecialistState) -> dict[str, Any]:
-        return self._run_specialist(state, "analyst")
-
-    def _risk_agent(self, state: SpecialistState) -> dict[str, Any]:
-        return self._run_specialist(state, "risk_reviewer")
-
-    def _comparison_agent(self, state: SpecialistState) -> dict[str, Any]:
-        return self._run_specialist(state, "comparator")
-
-    def _run_specialist(self, state: SpecialistState, agent_type: str) -> dict[str, Any]:
+    def _dynamic_worker(self, state: DynamicWorkerState) -> dict[str, Any]:
         task = state["task"]
-        if task.get("agent_type") != agent_type:
-            raise ValueError(f"确定性路由错误：{task.get('agent_type')} 任务进入 {agent_type}")
-        hits, retrieval_strategy = self._retrieve_hits(task, agent_type)
+        hits, retrieval_strategy = self._retrieve_hits(task)
         with self._record_lock:
             self._retrieval_strategies.add(retrieval_strategy)
-        evidence_budget = min(10_000, int(task.get("input_budget", 12_000)) - 2_000)
+        # input_budget is the maximum safe prompt budget, not a target. Leave room for
+        # the generated AgentSpec, current question and bounded conversation context.
+        evidence_budget = int(task.get("input_budget", 61_000)) - 4_000
         evidence_ids, packed = self._pack_evidence(
             hits,
             budget=max(1_000, evidence_budget),
@@ -505,8 +461,13 @@ class MultiAgentResearchSystem:
             {
                 "role": "system",
                 "content": (
-                    f"ROLE:SPECIALIST:{agent_type}。{SPECIALIST_INSTRUCTIONS[agent_type]}"
-                    "你只处理一个子任务，不知道其他 Agent 的消息。"
+                    "ROLE:DYNAMIC_WORKER。你不是预制角色，而是 Supervisor 为当前问题即时创建的执行 Agent。"
+                    f"Agent 名称：{task['agent_name']}。任务指令：{task['agent_instruction']}。"
+                    f"能力：{json.dumps(task.get('capabilities', []), ensure_ascii=False)}。"
+                    f"允许工具：{json.dumps(task.get('tools', []), ensure_ascii=False)}。"
+                    f"来源策略：{task.get('source_policy', 'none')}。"
+                    "你只处理当前子任务，不知道其他 Worker 的消息，也不能调用未授权工具。"
+                    "来源策略为 required 时，事实结论必须引用给定 evidence_id；为 none 时可使用模型通用知识。"
                     "返回JSON：{\"summary\":...,\"claims\":[...],\"evidence_ids\":[...],"
                     "\"confidence\":0到1}。不得编造证据ID。"
                 ),
@@ -515,18 +476,18 @@ class MultiAgentResearchSystem:
                 "role": "user",
                 "content": (
                     f"task_id：{task['task_id']}\n目标：{task['objective']}\n"
-                    f"检索词：{task['query']}\n"
+                    f"工作查询：{task['query']}\n"
                     + (
                         f"有界对话记忆（只用于理解当前问题，不可作为事实证据）：\n"
                         f"{self._conversation_context}\n"
                         if self._conversation_context else ""
                     )
-                    + f"\n本任务可见证据：\n{packed or '无匹配证据'}"
+                    + f"\n本任务可见的外部资料：\n{packed or '未提供外部资料；请按来源策略使用模型能力完成任务。'}"
                 ),
             },
         ]
         parsed, _ = self._call_json(
-            agent_type,
+            "worker",
             messages,
             max_tokens=1_800,
             required_keys=("summary", "evidence_ids"),
@@ -540,16 +501,25 @@ class MultiAgentResearchSystem:
         claims = [str(item)[:800] for item in parsed.get("claims", []) if str(item).strip()]
         summary = str(parsed.get("summary", "")).strip()
         if not summary:
-            summary = "未找到足以支持该子任务结论的证据。" if not hits else hits[0].chunk.text[:800]
+            summary = (
+                "没有足够的外部资料支持该子任务。"
+                if task.get("source_policy") == "required" and not hits
+                else (hits[0].chunk.text[:800] if hits else "当前 Agent 未形成有效结论。")
+            )
         finding = {
             "task_id": task["task_id"],
-            "agent_type": agent_type,
+            "agent_name": task["agent_name"],
+            "agent_instruction": task["agent_instruction"],
+            "capabilities": task.get("capabilities", []),
+            "tools": task.get("tools", []),
+            "source_policy": task.get("source_policy", "none"),
             "objective": task["objective"],
             "summary": summary[:1_500],
             "claims": claims[:8],
             "evidence_ids": valid_ids,
             "confidence": self._confidence(parsed.get("confidence")),
             "retrieval_strategy": retrieval_strategy,
+            "answer_basis": "external_sources" if valid_ids else "model_reasoning",
             "agent_instance_id": task.get("agent_instance_id"),
             "shard_index": task.get("shard_index"),
             "shard_count": task.get("shard_count"),
@@ -557,18 +527,19 @@ class MultiAgentResearchSystem:
         }
         finding["artifact_id"] = self.artifacts.put(
             "finding", json.dumps(finding, ensure_ascii=False),
-            {"task_id": task["task_id"], "agent_type": agent_type},
+            {"task_id": task["task_id"], "agent_name": task["agent_name"]},
         )
         return {
             "findings": [finding],
             "trace": [{
-                "node": SPECIALIST_NODE_MAP[agent_type],
-                "role": agent_type,
+                "node": "worker",
+                "role": task["agent_name"],
                 "task_id": task["task_id"],
                 "status": "completed",
                 "detail": (
                     f"独立执行完成；分片={task.get('shard_index', 1)}/{task.get('shard_count', 1)}；"
-                    f"分片大小={task.get('shard_bytes', 0)} Bytes；检索策略={retrieval_strategy}；"
+                    f"工具={','.join(task.get('tools', []))}；分片大小={task.get('shard_bytes', 0)} Bytes；"
+                    f"资料策略={retrieval_strategy}；"
                     f"引用 {len(valid_ids)} 个证据对象"
                 ),
                 "artifact_id": finding["artifact_id"],
@@ -578,9 +549,10 @@ class MultiAgentResearchSystem:
     def _retrieve_hits(
         self,
         task: dict[str, Any],
-        agent_type: str,
     ) -> tuple[list[SearchHit], str]:
-        """Combine exact retrieval with positional coverage for broad document questions."""
+        """Use bounded external context only when the generated Agent requests that tool."""
+        if "source_search" not in task.get("tools", []) or not self.index.chunks:
+            return [], "model_reasoning_only"
         query = str(task.get("query", ""))
         referential_terms = ("这个", "该内容", "上述", "前面", "刚才", "它", "其", "这些", "他们")
         if self._conversation_context and any(term in query for term in referential_terms):
@@ -604,7 +576,10 @@ class MultiAgentResearchSystem:
             chunk_end=chunk_end,
         )
         broad_terms = ("总结", "概括", "全文", "主要内容", "核心内容", "要点", "文档开头", "文档末尾")
-        needs_coverage = agent_type == "analyst" or any(term in compact for term in broad_terms)
+        capabilities = " ".join(str(item).casefold() for item in task.get("capabilities", []))
+        needs_coverage = any(term in capabilities for term in ("synthesis", "summary", "归纳", "总结")) or any(
+            term in compact for term in broad_terms
+        )
         if not needs_coverage:
             if lexical_hits:
                 return lexical_hits, "sharded_hybrid_exact"
@@ -677,7 +652,7 @@ class MultiAgentResearchSystem:
                 "source_exceeds_shard_limit": indexed_bytes > self.shard_byte_limit,
                 "shard_byte_limit": self.shard_byte_limit,
                 "task_id": task.get("task_id"),
-                "agent_type": task.get("agent_type"),
+                "agent_name": task.get("agent_name"),
                 "agent_instance_id": task.get("agent_instance_id"),
                 "shard_index": task.get("shard_index", 1),
                 "shard_count": task.get("shard_count", 1),
@@ -699,7 +674,7 @@ class MultiAgentResearchSystem:
                 group = current[offset : offset + self.reduce_fan_in]
                 messages = [
                     {"role": "system", "content": (
-                        "ROLE:REDUCER。合并一小组专业 Agent 的结构化结论，不读取原文。"
+                        "ROLE:REDUCER。合并一小组动态 Worker 的结构化结论，不读取完整原文。"
                         "返回JSON：{\"summary\":...,\"claims\":[...],\"evidence_ids\":[...]}。"
                     )},
                     {"role": "user", "content": json.dumps(group, ensure_ascii=False)},
@@ -727,7 +702,7 @@ class MultiAgentResearchSystem:
                 "detail": f"第 {level} 层：{len(current)} 个输入归并为 {len(next_level)} 个结果",
             })
             current = next_level
-        reduced = current[0] if current else {"summary": "没有专业 Agent 结论。", "claims": [], "evidence_ids": []}
+        reduced = current[0] if current else {"summary": "没有动态 Agent 结论。", "claims": [], "evidence_ids": []}
         return {"reduced": reduced, "trace": trace}
 
     def _validator(self, state: GraphState) -> dict[str, Any]:
@@ -737,6 +712,7 @@ class MultiAgentResearchSystem:
         messages = [
             {"role": "system", "content": (
                 "ROLE:VALIDATOR。你只做语义质量检查，不能改变工作流或放宽程序规则。"
+                "没有外部资料的通用推理任务可以不含 evidence_id；只有 source_policy=required 的任务必须有证据。"
                 "返回JSON：{\"semantic_pass\":true/false,\"missing_task_ids\":[...],"
                 "\"contradictions\":[...],\"notes\":...}。"
             )},
@@ -804,6 +780,7 @@ class MultiAgentResearchSystem:
     ) -> dict[str, Any]:
         task_ids = [str(task.get("task_id", "")) for task in tasks]
         known = set(task_ids)
+        tasks_by_id = {str(task.get("task_id", "")): task for task in tasks}
         findings_by_task = {str(item.get("task_id", "")): item for item in findings}
         missing = sorted(known - set(findings_by_task))
         invalid: list[str] = []
@@ -811,12 +788,15 @@ class MultiAgentResearchSystem:
             if task_id not in known:
                 invalid.append(f"unknown_task:{task_id}")
                 continue
-            if finding.get("agent_type") not in SPECIALIST_NODE_MAP:
-                invalid.append(f"invalid_agent_type:{task_id}")
+            task = tasks_by_id.get(task_id, {})
+            if not str(finding.get("agent_name", "")).strip():
+                invalid.append(f"missing_dynamic_agent_name:{task_id}")
+            if not str(task.get("agent_instruction", "")).strip():
+                invalid.append(f"missing_dynamic_agent_instruction:{task_id}")
             if not str(finding.get("summary", "")).strip():
                 invalid.append(f"empty_summary:{task_id}")
             evidence_ids = finding.get("evidence_ids", [])
-            if not evidence_ids:
+            if task.get("source_policy") == "required" and not evidence_ids:
                 missing.append(task_id)
             for evidence_id in evidence_ids:
                 artifact = self.artifacts.get(str(evidence_id))
@@ -879,7 +859,7 @@ class MultiAgentResearchSystem:
         if not active:
             return "finalizer"
         return [
-            Send(SPECIALIST_NODE_MAP[task["agent_type"]], {"question": state["question"], "task": task})
+            Send("worker", {"question": state["question"], "task": task})
             for task in active
         ]
 
@@ -887,10 +867,10 @@ class MultiAgentResearchSystem:
         validation = state.get("validation", {})
         messages = [
             {"role": "system", "content": (
-                "ROLE:FINALIZER。优先根据归并结果、证据和Validator报告回答文档问题。"
-                "文档特有的页码、数字、名称和结论不得脱离证据编造。"
-                "可以使用模型自身的通用知识解释概念、补充方法或给出建议，但必须放在“模型补充”下，"
-                "与“文档证据”明确分开。验证未通过时说明具体缺口后，仍应回答证据可以支持的部分。"
+                "ROLE:FINALIZER。根据动态 Agent 的归并结果和 Validator 报告直接回答用户问题。"
+                "对于带 evidence_id 的外部事实必须忠于证据；对于 source_policy=none 的任务可以使用"
+                "模型通用知识。不要把没有外部来源的通用答案错误描述为资料缺失。"
+                "验证未通过时说明具体缺口后，仍应回答现有结果能够支持的部分。"
             )},
             {"role": "user", "content": (
                 (
@@ -908,7 +888,7 @@ class MultiAgentResearchSystem:
             "stop_reason": "validated" if validation.get("approved") else "validation_failed_closed",
             "trace": [{
                 "node": "finalizer", "role": "Finalizer", "status": "completed",
-                "detail": "文档事实受证据约束；允许在明确标注后使用模型通用知识补充",
+                "detail": "汇总动态 Agent 结果；外部事实受证据约束，通用任务保留模型原生能力",
             }],
         }
 
@@ -975,12 +955,12 @@ class MultiAgentResearchSystem:
             bucket = by_role.setdefault(call["role"], {"calls": 0, "max_prompt_tokens": 0})
             bucket["calls"] += 1
             bucket["max_prompt_tokens"] = max(bucket["max_prompt_tokens"], measured(call))
-        specialist_counts: dict[str, int] = {}
+        dynamic_agent_counts: dict[str, int] = {}
         for task in tasks:
-            agent_type = task.get("agent_type", "unknown")
-            specialist_counts[agent_type] = specialist_counts.get(agent_type, 0) + 1
+            agent_name = str(task.get("agent_name") or "未命名 Agent")
+            dynamic_agent_counts[agent_name] = dynamic_agent_counts.get(agent_name, 0) + 1
         return {
-            "architecture": "LangGraph deterministic loop + Supervisor + Specialists + Validator",
+            "architecture": "LangGraph deterministic loop + Dynamic Agent Factory + Validator",
             "control_plane": "deterministic_code",
             "context_limit_tokens": self.context_limit,
             "hard_safe_input_tokens": self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN,
@@ -990,13 +970,25 @@ class MultiAgentResearchSystem:
                 measured(call) + OUTPUT_RESERVE + SAFETY_MARGIN <= self.context_limit
                 for call in self._calls
             ),
-            "isolated_specialist_contexts": True,
+            "isolated_worker_contexts": True,
             "supervisor_received_raw_document": False,
             "task_count": len(tasks),
-            "specialist_counts": specialist_counts,
+            "dynamic_agent_counts": dynamic_agent_counts,
+            "generated_agent_profiles": [
+                {
+                    "task_id": task.get("task_id"),
+                    "agent_name": task.get("agent_name"),
+                    "capabilities": task.get("capabilities", []),
+                    "tools": task.get("tools", []),
+                    "source_policy": task.get("source_policy", "none"),
+                }
+                for task in tasks
+            ],
             "model_calls": len(self._calls),
             "planning_source": self._planning_source,
             "intent": self._intent,
+            "agent_strategy": self._agent_strategy,
+            "available_tools": sorted(self.available_tools),
             "structured_output_retries": self._json_retries,
             "retrieval_strategies": sorted(self._retrieval_strategies),
             "agent_allocation": dict(self._allocation),
@@ -1026,7 +1018,7 @@ class MultiAgentResearchSystem:
             "source_exceeds_shard_limit": artifact.metadata.get("source_exceeds_shard_limit", False),
             "shard_byte_limit": artifact.metadata.get("shard_byte_limit", self.shard_byte_limit),
             "task_id": artifact.metadata.get("task_id"),
-            "agent_type": artifact.metadata.get("agent_type"),
+            "agent_name": artifact.metadata.get("agent_name"),
             "agent_instance_id": artifact.metadata.get("agent_instance_id"),
             "shard_index": artifact.metadata.get("shard_index", 1),
             "shard_count": artifact.metadata.get("shard_count", 1),
@@ -1037,7 +1029,10 @@ class MultiAgentResearchSystem:
     def _finding_summary(finding: dict[str, Any]) -> dict[str, Any]:
         return {
             "task_id": finding.get("task_id"),
-            "agent_type": finding.get("agent_type"),
+            "agent_name": finding.get("agent_name"),
+            "capabilities": finding.get("capabilities", [])[:8],
+            "tools": finding.get("tools", [])[:8],
+            "source_policy": finding.get("source_policy", "none"),
             "summary": str(finding.get("summary", ""))[:1_500],
             "claims": finding.get("claims", [])[:8],
             "evidence_ids": finding.get("evidence_ids", [])[:12],
