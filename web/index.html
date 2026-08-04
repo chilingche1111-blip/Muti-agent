@@ -79,6 +79,10 @@
               <button id="clear-conversation" class="icon-text-button" type="button" disabled>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M9 7l1-2h4l1 2m3 0l-1 14H7L6 7"/></svg>清空记录
               </button>
+              <button id="runtime-settings-toggle" class="agent-monitor-toggle" type="button" aria-controls="runtime-settings" aria-expanded="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM19.4 15a7.8 7.8 0 00.1-2l2-1.6-2-3.4-2.5 1a7.5 7.5 0 00-1.7-1L14.8 5h-4l-.4 3a7.5 7.5 0 00-1.7 1L6.2 8l-2 3.4 2 1.6a7.8 7.8 0 000 2l-2 1.6 2 3.4 2.5-1a7.5 7.5 0 001.7 1l.4 3h4l.4-3a7.5 7.5 0 001.7-1l2.5 1 2-3.4-2-1.6z"/></svg>
+                <span><strong>运行设置</strong><small id="runtime-settings-summary">最多 16 Agent</small></span>
+              </button>
               <button id="agent-monitor-toggle" class="agent-monitor-toggle" type="button" aria-controls="agent-monitor" aria-expanded="false" disabled>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h5v5H4zM15 4h5v5h-5zM15 15h5v5h-5zM9 9l6-3M9 11l6 6"/></svg>
                 <span><strong>Agent 监控</strong><small id="agent-monitor-summary">暂无运行</small></span>
@@ -100,6 +104,30 @@
           </header>
           <p id="agent-monitor-context" class="agent-monitor-context"></p>
           <div id="agent-monitor-content"></div>
+        </aside>
+
+        <aside id="runtime-settings" class="runtime-settings-drawer" aria-label="多 Agent 运行设置" hidden>
+          <header class="agent-monitor-drawer-head">
+            <span><strong>运行设置</strong><small>控制超长产物的分治规模与 API 压力</small></span>
+            <button id="runtime-settings-close" class="icon-button" type="button" aria-label="关闭运行设置">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </header>
+          <div class="settings-intro">
+            <strong>最终输出可远超单次 64K</strong>
+            <p>正文由多个 Agent 分段生成并保存在窗口外，最后按顺序无损组装。最大 Agent 数决定总产物容量，并行请求数只决定同时访问公司 API 的压力。</p>
+          </div>
+          <div class="runtime-settings-grid">
+            <div class="field"><label for="default-agents">默认 Agent 数</label><input id="default-agents" type="number" min="1" max="128" value="3" /><small>再小的多 Agent 任务也至少使用此数量。</small></div>
+            <div class="field"><label for="max-workers">最大 Agent 数</label><input id="max-workers" type="number" min="1" max="128" value="16" /><small>超长产物会按需要扩展，最高128个。</small></div>
+            <div class="field"><label for="parallel-workers">并行请求数</label><input id="parallel-workers" type="number" min="1" max="16" value="4" /><small>建议公司 API 从4开始，避免瞬时过载。</small></div>
+            <div class="field"><label for="target-artifact-characters">目标分段长度</label><input id="target-artifact-characters" type="number" min="400" max="8000" step="100" value="1200" /><small>目标总字数 ÷ 此值，决定正文 Agent 数量。</small></div>
+            <div class="field"><label for="max-artifact-output-tokens">单 Agent 最大输出 Token</label><input id="max-artifact-output-tokens" type="number" min="2000" max="24000" step="500" value="12000" /><small>为每个正文分段设置生成上限，仍计入独立64K窗口。</small></div>
+            <div class="field"><label for="reduce-fan-in">Reducer 扇入</label><input id="reduce-fan-in" type="number" min="2" max="8" value="4" /><small>普通综合任务每次归并的结果数量。</small></div>
+            <div class="field"><label for="max-replans">最大重规划次数</label><input id="max-replans" type="number" min="0" max="3" value="1" /><small>字数不足或产物缺失时，仅重试失败部分。</small></div>
+          </div>
+          <div class="settings-capacity" id="settings-capacity-preview"></div>
+          <div class="settings-actions"><button id="reset-runtime-settings" class="button secondary" type="button">恢复默认值</button><button id="save-runtime-settings" class="button primary" type="button">保存设置</button></div>
         </aside>
 
         <div id="result-panel" class="conversation" role="region" aria-label="研究结果，可滚动" aria-live="polite" tabindex="0">
@@ -146,7 +174,7 @@
           </div>
           <div class="composer-footer">
             <p id="mode-hint">智能回答 · 自动判断通用问答或文档 Agent。</p>
-            <details class="advanced-settings"><summary>运行参数</summary><div class="advanced-popover"><div class="field"><label for="default-agents">默认 Agent 数</label><input id="default-agents" type="number" min="1" max="32" value="3" /></div><div class="field"><label for="max-workers">最大 Agent 数</label><input id="max-workers" type="number" min="1" max="32" value="16" /></div><div class="field"><label for="reduce-fan-in">Reducer 扇入</label><input id="reduce-fan-in" type="number" min="2" max="8" value="4" /></div><p class="parameter-note">Agent 的职责和工具由问题动态决定；数量由任务复杂度、输入规模和配置上限共同决定。</p></div></details>
+            <button id="composer-settings-shortcut" class="text-button" type="button">调整超长输出设置</button>
           </div>
         </footer>
       </section>

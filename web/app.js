@@ -1,8 +1,10 @@
 "use strict";
 
 const CONVERSATION_STORAGE_KEY = "context-atlas-conversation-v1";
+const RUNTIME_SETTINGS_STORAGE_KEY = "context-atlas-runtime-settings-v1";
 const MAX_STORED_TURNS = 30;
 const MAX_STORED_CHARACTERS = 2_500_000;
+const DEFAULT_RUNTIME_SETTINGS = Object.freeze({ default_agents: 3, max_workers: 16, parallel_workers: 4, target_artifact_characters: 1200, max_artifact_output_tokens: 12000, reduce_fan_in: 4, max_replans: 1 });
 const state = { mode: "live", scope: "auto", document: null, profiles: [], lastQuestion: "", turns: [] };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -11,11 +13,80 @@ const elements = {
   profileName: $("#profile-name"), profileSelect: $("#profile-select"), connectionStatus: $("#connection-status"),
   documentStatus: $("#document-status"), fileInput: $("#document-file"), dropZone: $("#drop-zone"),
   question: $("#question"), defaultAgents: $("#default-agents"), maxWorkers: $("#max-workers"), reduceFanIn: $("#reduce-fan-in"),
+  parallelWorkers: $("#parallel-workers"), targetArtifactCharacters: $("#target-artifact-characters"), maxArtifactOutputTokens: $("#max-artifact-output-tokens"), maxReplans: $("#max-replans"),
   resultPanel: $("#result-panel"), resultEmpty: $(".result-empty"), resultContent: $("#conversation-history"),
   agentMonitor: $("#agent-monitor"), agentMonitorToggle: $("#agent-monitor-toggle"), agentMonitorSummary: $("#agent-monitor-summary"),
   agentMonitorContext: $("#agent-monitor-context"), agentMonitorContent: $("#agent-monitor-content"),
+  runtimeSettings: $("#runtime-settings"), runtimeSettingsToggle: $("#runtime-settings-toggle"), runtimeSettingsSummary: $("#runtime-settings-summary"),
   turnCount: $("#turn-count"), clearConversation: $("#clear-conversation"), modeHint: $("#mode-hint"),
 };
+
+function runtimeSettingsFromInputs() {
+  const settings = {
+    default_agents: Number(elements.defaultAgents.value),
+    max_workers: Number(elements.maxWorkers.value),
+    parallel_workers: Number(elements.parallelWorkers.value),
+    target_artifact_characters: Number(elements.targetArtifactCharacters.value),
+    max_artifact_output_tokens: Number(elements.maxArtifactOutputTokens.value),
+    reduce_fan_in: Number(elements.reduceFanIn.value),
+    max_replans: Number(elements.maxReplans.value),
+  };
+  Object.entries(settings).forEach(([name, value]) => { if (!Number.isInteger(value)) throw new Error(`${name} 必须是整数。`); });
+  if (settings.default_agents < 1 || settings.default_agents > 128) throw new Error("默认 Agent 数必须在 1至128 之间。");
+  if (settings.max_workers < settings.default_agents || settings.max_workers > 128) throw new Error("最大 Agent 数必须大于等于默认 Agent 数，且不超过128。");
+  if (settings.parallel_workers < 1 || settings.parallel_workers > 16) throw new Error("并行请求数必须在 1至16 之间。");
+  if (settings.target_artifact_characters < 400 || settings.target_artifact_characters > 8000) throw new Error("目标分段长度必须在 400至8000 字符之间。");
+  if (settings.max_artifact_output_tokens < 2000 || settings.max_artifact_output_tokens > 24000) throw new Error("单 Agent 最大输出必须在2000至24000 Token之间。");
+  if (settings.reduce_fan_in < 2 || settings.reduce_fan_in > 8) throw new Error("Reducer 扇入必须在2至8之间。");
+  if (settings.max_replans < 0 || settings.max_replans > 3) throw new Error("最大重规划次数必须在0至3之间。");
+  return settings;
+}
+
+function applyRuntimeSettings(settings) {
+  const resolved = { ...DEFAULT_RUNTIME_SETTINGS, ...(settings || {}) };
+  elements.defaultAgents.value = resolved.default_agents;
+  elements.maxWorkers.value = resolved.max_workers;
+  elements.parallelWorkers.value = resolved.parallel_workers;
+  elements.targetArtifactCharacters.value = resolved.target_artifact_characters;
+  elements.maxArtifactOutputTokens.value = resolved.max_artifact_output_tokens;
+  elements.reduceFanIn.value = resolved.reduce_fan_in;
+  elements.maxReplans.value = resolved.max_replans;
+  updateRuntimeSettingsPreview();
+}
+
+function updateRuntimeSettingsPreview() {
+  let settings;
+  try { settings = runtimeSettingsFromInputs(); } catch { settings = { ...DEFAULT_RUNTIME_SETTINGS }; }
+  const contentAgents = Math.max(1, settings.max_workers - 2);
+  const pooledTokens = contentAgents * settings.max_artifact_output_tokens;
+  elements.runtimeSettingsSummary.textContent = `最多 ${number(settings.max_workers)} Agent · 并行 ${number(settings.parallel_workers)}`;
+  $("#settings-capacity-preview").replaceChildren(
+    document.createTextNode("配置的理论正文窗口池："),
+    node("strong", "", `${number(contentAgents)} × ${number(settings.max_artifact_output_tokens)} = ${number(pooledTokens)} Token`),
+    document.createTextNode(`，约为单次64K窗口的 ${(pooledTokens / 64_000).toFixed(1)} 倍。实际输出取决于任务目标和模型网关允许的单次输出。`),
+  );
+}
+
+function setRuntimeSettingsOpen(open) {
+  elements.runtimeSettings.hidden = !open;
+  elements.runtimeSettingsToggle.setAttribute("aria-expanded", String(open));
+  if (open) { setAgentMonitorOpen(false); $("#runtime-settings-close").focus(); }
+}
+
+function saveRuntimeSettings() {
+  try {
+    const settings = runtimeSettingsFromInputs();
+    localStorage.setItem(RUNTIME_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    updateRuntimeSettingsPreview();
+    setRuntimeSettingsOpen(false);
+    toast("运行设置已保存。超长产物会按新上限动态扩展 Agent。");
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function loadRuntimeSettings() {
+  try { applyRuntimeSettings(JSON.parse(localStorage.getItem(RUNTIME_SETTINGS_STORAGE_KEY) || "null")); }
+  catch { applyRuntimeSettings(DEFAULT_RUNTIME_SETTINGS); }
+}
 
 function apiConfig() {
   return { base_url: elements.baseUrl.value.trim(), api_key: elements.apiKey.value.trim(), model: elements.model.value.trim(), timeout_seconds: Number(elements.timeout.value || 90) };
@@ -82,13 +153,15 @@ function icon(pathData) {
 
 function compactResult(result) {
   return {
-    answer: String(result.answer || "").slice(0, 80_000),
+    // A complete deliverable is intentionally kept outside model context and must
+    // not be truncated again when it reaches conversation storage or rendering.
+    answer: String(result.answer || ""),
     execution_mode: result.execution_mode || "",
     stop_reason: result.stop_reason || "",
     validation: result.validation || {},
     capacity_report: result.capacity_report || {},
     document_read: result.document_read || null,
-    tasks: (result.tasks || []).slice(0, 32).map((task) => ({
+    tasks: (result.tasks || []).slice(0, 128).map((task) => ({
       task_id: task.task_id,
       agent_instance_id: task.agent_instance_id,
       agent_name: task.agent_name,
@@ -106,6 +179,11 @@ function compactResult(result) {
       depends_on: task.depends_on || [],
       phase: task.phase || 0,
       required_targets: task.required_targets || [],
+      output_mode: task.output_mode || "finding",
+      include_in_final: Boolean(task.include_in_final),
+      sequence: task.sequence || 0,
+      target_characters: task.target_characters || 0,
+      artifact_label: task.artifact_label || "",
     })),
     citations: (result.citations || []).slice(0, 40).map((citation) => ({
       ...citation,
@@ -314,8 +392,8 @@ function resultLabels(result) {
   return {
     documentRead,
     generalChat,
-    mode: documentRead ? "PDF / 文档原文" : (generalChat ? "LLM 直接回答" : (offlineDemo ? "流程演示结果" : "动态多 Agent 回答")),
-    status: documentRead ? "原文直接读取" : (generalChat ? "直接回答" : (offlineDemo ? "测试模型" : (result.validation?.approved ? "Validator 通过" : "Validator 拒绝"))),
+    mode: documentRead ? "PDF / 文档原文" : (generalChat ? "LLM 直接回答" : (offlineDemo ? "流程演示结果" : (result.capacity_report?.deliverable_report?.required ? "动态多 Agent 完整产物" : "动态多 Agent 回答"))),
+    status: documentRead ? "原文直接读取" : (generalChat ? "直接回答" : (offlineDemo ? "测试模型" : (result.validation?.approved ? (result.capacity_report?.deliverable_report?.required ? "全文已组装" : "Validator 通过") : "Validator 拒绝"))),
   };
 }
 
@@ -486,11 +564,18 @@ function createCoverageMonitor(result) {
   head.append(title, node("strong", coverage.complete === false ? "coverage-fail" : "coverage-pass", hasCoverage ? `${percent.toFixed(1)}%` : "无需资料"));
 
   const gateGrid = node("div", "quality-gate-grid");
-  [
+  const gateItems = [
     ["容量", gates.capacity_passed !== false, `${number(report.max_accounted_total_tokens || report.max_single_agent_prompt_tokens)} / ${number(report.context_limit_tokens || 64_000)} Token`],
     ["覆盖", gates.coverage_passed !== false, hasCoverage ? `${number(coverage.covered_chunks)} / ${number(coverage.document_chunks)} 块` : "不需要来源"],
     ["答案", gates.answer_passed !== false, result.validation?.approved ? "Validator 通过" : "Validator 拒绝"],
-  ].forEach(([label, passed, detail]) => {
+  ];
+  const deliverable = report.deliverable_report || {};
+  if (deliverable.required) gateItems.push([
+    "完整产物",
+    deliverable.complete === true,
+    `${number(deliverable.completed_parts)} / ${number(deliverable.expected_parts)} 部分 · ${number(deliverable.actual_characters)} 字符`,
+  ]);
+  gateItems.forEach(([label, passed, detail]) => {
     const item = node("div", passed ? "gate-pass" : "gate-fail");
     item.append(node("i", "", passed ? "✓" : "×"), node("span", "", label), node("strong", "", detail));
     gateGrid.append(item);
@@ -664,7 +749,11 @@ function setAgentMonitorOpen(open) {
   const shouldReturnFocus = !shouldOpen && document.activeElement === $("#agent-monitor-close");
   elements.agentMonitor.hidden = !shouldOpen;
   elements.agentMonitorToggle.setAttribute("aria-expanded", String(shouldOpen));
-  if (shouldOpen) $("#agent-monitor-close").focus();
+  if (shouldOpen) {
+    elements.runtimeSettings.hidden = true;
+    elements.runtimeSettingsToggle.setAttribute("aria-expanded", "false");
+    $("#agent-monitor-close").focus();
+  }
   else if (shouldReturnFocus) elements.agentMonitorToggle.focus();
 }
 
@@ -694,11 +783,8 @@ async function runResearch() {
     const question = elements.question.value.trim();
     if (!question) throw new Error("请输入调研问题。");
     state.lastQuestion = question;
-    const defaultAgents = Number(elements.defaultAgents.value);
-    const maxWorkers = Number(elements.maxWorkers.value);
-    if (!Number.isInteger(defaultAgents) || defaultAgents < 1 || defaultAgents > 32) throw new Error("默认 Agent 数必须在 1至32 之间。");
-    if (!Number.isInteger(maxWorkers) || maxWorkers < defaultAgents || maxWorkers > 32) throw new Error("最大 Agent 数必须大于等于默认 Agent 数，且不超过32。");
-    const payload = { mode: state.mode, answer_scope: state.scope, web_search: $("#web-search-toggle").checked, question, history: modelHistory(), default_agents: defaultAgents, max_workers: maxWorkers, reduce_fan_in: Number(elements.reduceFanIn.value) };
+    const runtimeSettings = runtimeSettingsFromInputs();
+    const payload = { mode: state.mode, answer_scope: state.scope, web_search: $("#web-search-toggle").checked, question, history: modelHistory(), ...runtimeSettings };
     if (state.mode === "live") {
       const config = apiConfig();
       if (config.base_url && config.api_key && config.model) payload.api = validateApiConfig();
@@ -757,6 +843,16 @@ elements.clearConversation.addEventListener("click", () => {
 });
 elements.agentMonitorToggle.addEventListener("click", () => setAgentMonitorOpen(elements.agentMonitor.hidden));
 $("#agent-monitor-close").addEventListener("click", () => setAgentMonitorOpen(false));
-document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !elements.agentMonitor.hidden) setAgentMonitorOpen(false); });
+elements.runtimeSettingsToggle.addEventListener("click", () => setRuntimeSettingsOpen(elements.runtimeSettings.hidden));
+$("#composer-settings-shortcut").addEventListener("click", () => setRuntimeSettingsOpen(true));
+$("#runtime-settings-close").addEventListener("click", () => setRuntimeSettingsOpen(false));
+$("#save-runtime-settings").addEventListener("click", saveRuntimeSettings);
+$("#reset-runtime-settings").addEventListener("click", () => { applyRuntimeSettings(DEFAULT_RUNTIME_SETTINGS); localStorage.removeItem(RUNTIME_SETTINGS_STORAGE_KEY); toast("已恢复默认运行设置。"); });
+[elements.defaultAgents, elements.maxWorkers, elements.parallelWorkers, elements.targetArtifactCharacters, elements.maxArtifactOutputTokens, elements.reduceFanIn, elements.maxReplans].forEach((input) => input.addEventListener("input", updateRuntimeSettingsPreview));
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!elements.runtimeSettings.hidden) setRuntimeSettingsOpen(false);
+  else if (!elements.agentMonitor.hidden) setAgentMonitorOpen(false);
+});
 
-setMode("live"); setScope("auto"); loadProfiles(); restoreConversation(); restoreCurrentDocument();
+setMode("live"); setScope("auto"); loadRuntimeSettings(); loadProfiles(); restoreConversation(); restoreCurrentDocument();
