@@ -63,14 +63,14 @@ class MultiAgentContextTests(unittest.TestCase):
         result = system.answer("请总结全文的主要内容。")
         self.assertEqual(result.context_metrics["intent"], "offline_dynamic_plan")
         self.assertIn(
-            "sharded_hybrid_plus_positional_coverage",
+            "sharded_full_coverage",
             result.context_metrics["retrieval_strategies"],
         )
-        cited_indices = sorted(
-            int(str(item["chunk_id"]).split("_")[-1]) for item in result.citations
-        )
-        self.assertLessEqual(cited_indices[0], 1)
-        self.assertGreaterEqual(cited_indices[-1], len(self.index.chunks) - 2)
+        self.assertTrue(result.context_metrics["coverage_report"]["complete"])
+        self.assertEqual(result.context_metrics["coverage_report"]["coverage_percent"], 100.0)
+        coverage = result.context_metrics["coverage_report"]
+        self.assertEqual(coverage["covered_chunks"], len(self.index.chunks))
+        self.assertEqual(coverage["completed_shards"], coverage["total_shards"])
 
     def test_invalid_dynamic_worker_json_is_repaired_once(self) -> None:
         class RepairableModel:
@@ -201,7 +201,7 @@ class MultiAgentContextTests(unittest.TestCase):
         allocation = result.context_metrics["agent_allocation"]
         self.assertTrue(allocation["exhaustive_scan"])
         self.assertGreater(allocation["allocated_agents"], 3)
-        self.assertIn("sharded_exhaustive_scan", result.context_metrics["retrieval_strategies"])
+        self.assertIn("sharded_full_coverage", result.context_metrics["retrieval_strategies"])
         self.assertIn("EMP-0001", result.answer)
         self.assertIn("EMP-0060", result.answer)
         self.assertTrue(result.validation["approved"])
@@ -265,6 +265,97 @@ class MultiAgentContextTests(unittest.TestCase):
         self.assertFalse(result.citations)
         self.assertIn("分层插件接口", result.answer)
         self.assertEqual(result.context_metrics["retrieval_strategies"], ["model_reasoning_only"])
+
+    def test_loaded_document_does_not_scale_source_free_agents(self) -> None:
+        class SourceFreeModel(DeterministicTestModel):
+            def chat(self, messages, *, temperature=0.1, max_tokens=2_000):
+                if "ROLE:SUPERVISOR" in messages[0]["content"]:
+                    return json.dumps({
+                        "problem_type": "creative_writing",
+                        "strategy": "多视角写作",
+                        "tasks": [{
+                            "objective": "撰写产品介绍",
+                            "query": "撰写产品介绍",
+                            "agent_name": "产品文案 Agent",
+                            "agent_instruction": "使用模型原生能力完成文案。",
+                            "capabilities": ["writing"],
+                            "tools": ["model_reasoning"],
+                            "source_policy": "none",
+                            "priority": 80,
+                            "depends_on": [],
+                        }],
+                    }, ensure_ascii=False)
+                return super().chat(messages, temperature=temperature, max_tokens=max_tokens)
+
+        result = MultiAgentResearchSystem(
+            SourceFreeModel(), self.index, default_agents=3, max_workers=16,
+        ).answer("写一段产品介绍。")
+        allocation = result.context_metrics["agent_allocation"]
+        self.assertFalse(allocation["source_scaling_active"])
+        self.assertEqual(allocation["allocated_agents"], 3)
+        self.assertFalse(result.context_metrics["coverage_report"]["required"])
+
+    def test_dependency_graph_runs_ready_tasks_in_waves(self) -> None:
+        class DependencyModel:
+            last_usage = None
+
+            def chat(self, messages, *, temperature=0.1, max_tokens=2_000):
+                system = messages[0]["content"]
+                prompt = messages[-1]["content"]
+                if "ROLE:SUPERVISOR" in system:
+                    return json.dumps({
+                        "problem_type": "novel",
+                        "strategy": "先大纲、后章节、再一致性检查",
+                        "tasks": [
+                            {"objective": "生成总纲", "query": "总纲", "agent_name": "总纲 Agent", "agent_instruction": "生成总纲", "capabilities": ["outline"], "tools": ["model_reasoning"], "source_policy": "none", "priority": 90, "depends_on": []},
+                            {"objective": "撰写第一章", "query": "第一章", "agent_name": "章节 Agent", "agent_instruction": "依据总纲写第一章", "capabilities": ["writing"], "tools": ["model_reasoning"], "source_policy": "none", "priority": 80, "depends_on": ["task_01"]},
+                            {"objective": "一致性检查", "query": "一致性", "agent_name": "一致性 Agent", "agent_instruction": "检查总纲和章节", "capabilities": ["consistency"], "tools": ["model_reasoning"], "source_policy": "none", "priority": 70, "depends_on": ["task_02"]},
+                        ],
+                    }, ensure_ascii=False)
+                if "ROLE:DYNAMIC_WORKER" in system:
+                    dependency_seen = "依赖任务的结构化结果" in prompt
+                    return json.dumps({"summary": "完成", "facts": ["依赖已读取" if dependency_seen else "根任务"], "claims": ["完成"], "uncertainties": [], "contradictions": [], "evidence_ids": [], "confidence": 1.0}, ensure_ascii=False)
+                if "ROLE:REDUCER" in system:
+                    return json.dumps({"summary": "小说任务完成", "claims": [], "evidence_ids": []}, ensure_ascii=False)
+                if "ROLE:VALIDATOR" in system:
+                    return json.dumps({"semantic_pass": True, "missing_task_ids": [], "contradictions": [], "notes": "依赖链完整"}, ensure_ascii=False)
+                if "ROLE:FINALIZER" in system:
+                    return "小说任务完成"
+                raise AssertionError("unexpected role")
+
+        result = MultiAgentResearchSystem(
+            DependencyModel(), DocumentIndex(), default_agents=1, max_workers=8,
+        ).answer("写一章小说并检查一致性")
+        scheduler_steps = [item for item in result.trace if item["node"] == "dependency_scheduler"]
+        self.assertGreaterEqual(len(scheduler_steps), 3)
+        self.assertEqual([task["phase"] for task in result.tasks], [0, 1, 2])
+        self.assertTrue(result.validation["approved"])
+
+    def test_negative_claim_requires_complete_coverage(self) -> None:
+        system = MultiAgentResearchSystem(DeterministicTestModel(), self.index)
+        task = {
+            "task_id": "task_01", "agent_name": "核查 Agent", "agent_instruction": "完整核查",
+            "source_policy": "required", "coverage_required": True,
+            "chunk_start": 0, "chunk_end": len(self.index.chunks), "shard_chunks": len(self.index.chunks),
+        }
+        finding = {
+            "task_id": "task_01", "agent_name": "核查 Agent", "summary": "未找到目标值",
+            "facts": [], "claims": [], "evidence_ids": [], "negative_claim": True,
+            "coverage": {"required": True, "complete": False, "scanned_chunks": 3, "assigned_chunks": len(self.index.chunks)},
+        }
+        hard = system._hard_validation([task], [finding], {"evidence_ids": []})
+        self.assertFalse(hard["passed"])
+        self.assertFalse(hard["checks"]["source_coverage_complete"])
+        self.assertFalse(hard["checks"]["negative_claims_supported"])
+        self.assertIn("unsupported_negative_claim", hard["violations"])
+
+    def test_context_accounting_exposes_reserve_and_total(self) -> None:
+        result = MultiAgentResearchSystem(DeterministicTestModel(), self.index).answer("项目代号是什么？")
+        accounting = result.context_metrics["token_accounting"]
+        self.assertEqual(accounting["output_reserve_tokens"], 2_000)
+        self.assertEqual(accounting["safety_margin_tokens"], 1_000)
+        self.assertTrue(all("accounted_total_tokens" in call for call in result.context_metrics["calls"]))
+        self.assertLessEqual(result.context_metrics["max_accounted_total_tokens"], 64_000)
 
     def test_validator_hard_checks_cannot_be_bypassed_by_model(self) -> None:
         system = MultiAgentResearchSystem(DeterministicTestModel(), self.index)

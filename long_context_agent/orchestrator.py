@@ -24,6 +24,7 @@ SAFETY_MARGIN = 1_000
 DEFAULT_AGENT_COUNT = 3
 SOURCE_SHARD_BYTE_LIMIT = 64 * 1024
 TARGET_CHUNKS_PER_AGENT = 128
+TARGET_SOURCE_TOKENS_PER_AGENT = 45_000
 EXHAUSTIVE_SCAN_TERMS = ("全部", "所有", "完整清单", "逐条", "逐项", "员工信息", "员工名单")
 SOURCE_POLICIES = {"none", "optional", "required"}
 BUILTIN_TOOLS = {"model_reasoning", "source_search", "web_sources"}
@@ -53,11 +54,13 @@ class GraphState(TypedDict, total=False):
     planning_source: str
     intent: str
     agent_allocation: dict[str, Any]
+    dependency_phase: int
 
 
 class DynamicWorkerState(TypedDict):
     question: str
     task: dict[str, Any]
+    dependency_findings: list[dict[str, Any]]
 
 
 def parse_json_object(text: str) -> dict[str, Any] | None:
@@ -147,6 +150,7 @@ class MultiAgentResearchSystem:
         graph = StateGraph(GraphState)
         graph.add_node("supervisor", self._supervisor)
         graph.add_node("worker", self._dynamic_worker)
+        graph.add_node("dependency_scheduler", self._dependency_scheduler)
         graph.add_node("reducer", self._reduce_tree)
         graph.add_node("validator", self._validator)
         graph.add_node("supervisor_replan", self._supervisor_replan)
@@ -154,7 +158,12 @@ class MultiAgentResearchSystem:
 
         graph.add_edge(START, "supervisor")
         graph.add_conditional_edges("supervisor", self._dispatch_active_tasks, ["worker"])
-        graph.add_edge("worker", "reducer")
+        graph.add_edge("worker", "dependency_scheduler")
+        graph.add_conditional_edges(
+            "dependency_scheduler",
+            self._route_dependencies,
+            ["worker", "reducer"],
+        )
         graph.add_edge("reducer", "validator")
         graph.add_conditional_edges(
             "validator",
@@ -203,7 +212,7 @@ class MultiAgentResearchSystem:
             findings=findings,
             trace=state.get("trace", []),
             validation=state.get("validation", {}),
-            context_metrics=self._context_metrics(state.get("tasks", [])),
+            context_metrics=self._context_metrics(state.get("tasks", []), findings),
             stop_reason=state.get("stop_reason", "completed"),
         )
 
@@ -226,10 +235,12 @@ class MultiAgentResearchSystem:
                     "tools 只能使用本次明确提供的工具；capabilities 可以按问题自由命名。"
                     "source_policy 只能是 none、optional、required：不需要外部资料、可选参考资料、"
                     "或结论必须由外部资料支持。"
+                    "任务存在先后依赖时，depends_on 只能引用排在当前任务之前的 task_XX；"
+                    "没有依赖时返回空数组。创作类任务应先生成总纲，再并行生成章节，最后执行一致性检查。"
                     "返回JSON：{\"problem_type\":...,\"strategy\":...,\"tasks\":[{"
                     "\"objective\":...,\"query\":...,\"agent_name\":...,"
                     "\"agent_instruction\":...,\"capabilities\":[...],\"tools\":[...],"
-                    "\"source_policy\":...,\"priority\":1到100}]}。"
+                    "\"source_policy\":...,\"priority\":1到100,\"depends_on\":[\"task_01\"]}]}。"
                     f"最多{self.max_workers}项。"
                 ),
             },
@@ -255,14 +266,18 @@ class MultiAgentResearchSystem:
         intent = str(parsed.get("problem_type") or "general_problem")[:120]
         strategy = str(parsed.get("strategy") or "动态生成执行 Agent 并按子任务并行求解")[:500]
         tasks = self._allocate_agent_tasks(tasks, question)
+        active_tasks = [task for task in tasks if not task.get("depends_on")]
+        if not active_tasks and tasks:
+            active_tasks = [tasks[0]]
         self._planning_source = planning_source
         self._intent = intent
         self._agent_strategy = strategy
         generated_names = list(dict.fromkeys(task["agent_name"] for task in tasks))
         return {
             "tasks": tasks,
-            "active_tasks": tasks,
+            "active_tasks": active_tasks,
             "iteration": 0,
+            "dependency_phase": 0,
             "planning_source": planning_source,
             "intent": intent,
             "agent_allocation": dict(self._allocation),
@@ -273,7 +288,8 @@ class MultiAgentResearchSystem:
                 "detail": (
                     f"问题类型={intent}；策略={strategy}；"
                     f"运行时生成 {len(generated_names)} 种 Agent 规格，"
-                    f"分配 {self._allocation.get('allocated_agents', len(tasks))} 个隔离实例"
+                    f"分配 {self._allocation.get('allocated_agents', len(tasks))} 个隔离实例；"
+                    f"首波执行 {len(active_tasks)} 个无依赖任务"
                 ),
                 "task_ids": [task["task_id"] for task in tasks],
                 "generated_agents": generated_names,
@@ -313,6 +329,14 @@ class MultiAgentResearchSystem:
                     priority = max(1, min(100, int(raw.get("priority", 50))))
                 except (TypeError, ValueError):
                     priority = 50
+                known_task_ids = {item.task_id for item in tasks}
+                requested_dependencies = self._string_list(raw.get("depends_on"), fallback=())
+                depends_on = tuple(
+                    item for item in requested_dependencies
+                    if item in known_task_ids
+                )
+                phases = {item.task_id: item.phase for item in tasks}
+                phase = 1 + max((phases[item] for item in depends_on), default=-1)
                 tasks.append(TaskSpec(
                     task_id=f"task_{len(tasks) + 1:02d}",
                     objective=objective,
@@ -327,6 +351,9 @@ class MultiAgentResearchSystem:
                         self.ROLE_BUDGETS["worker"],
                         self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN,
                     ),
+                    depends_on=depends_on,
+                    phase=phase,
+                    required_targets=(objective,) if source_policy == "required" else (),
                 ))
         if not tasks:
             tasks = [TaskSpec(
@@ -342,8 +369,9 @@ class MultiAgentResearchSystem:
                     self.ROLE_BUDGETS["worker"],
                     self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN,
                 ),
+                required_targets=(question[:500],) if self.index.chunks else (),
             )]
-        return [task.as_dict() for task in sorted(tasks, key=lambda item: -item.priority)]
+        return [task.as_dict() for task in tasks]
 
     @staticmethod
     def _string_list(value: Any, *, fallback: tuple[str, ...]) -> tuple[str, ...]:
@@ -357,14 +385,25 @@ class MultiAgentResearchSystem:
         base_tasks: list[dict[str, Any]],
         question: str,
     ) -> list[dict[str, Any]]:
-        """Scale worker count from source size and task complexity, then assign bounded shards."""
+        """Scale workers from the plan and only use source size for source-required work."""
         chunks = self.index.all_chunks()
         indexed_bytes = self.index.total_indexed_bytes
+        indexed_tokens = sum(chunk.estimated_tokens for chunk in chunks)
         compact = re.sub(r"\s+", "", question)
         exhaustive_scan = any(term in compact for term in EXHAUSTIVE_SCAN_TERMS)
+        source_tasks = [
+            task for task in base_tasks
+            if task.get("source_policy") == "required" and "source_search" in task.get("tools", [])
+        ]
+        source_scaling = bool(source_tasks and chunks)
         target_shard_bytes = self.shard_byte_limit // 2 if exhaustive_scan else self.shard_byte_limit
-        byte_required = max(1, math.ceil(indexed_bytes / target_shard_bytes))
-        chunk_required = max(1, math.ceil(len(chunks) / TARGET_CHUNKS_PER_AGENT))
+        target_shard_tokens = min(
+            TARGET_SOURCE_TOKENS_PER_AGENT,
+            self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN - 8_000,
+        )
+        byte_required = max(1, math.ceil(indexed_bytes / target_shard_bytes)) if source_scaling else 1
+        token_required = max(1, math.ceil(indexed_tokens / target_shard_tokens)) if source_scaling else 1
+        chunk_required = max(1, math.ceil(len(chunks) / TARGET_CHUNKS_PER_AGENT)) if source_scaling else 1
         complexity_markers = sum(
             compact.count(marker)
             for marker in ("同时", "分别", "逐项", "以及", "并且", "、", "；", "比较", "风险")
@@ -374,17 +413,20 @@ class MultiAgentResearchSystem:
             self.default_agents,
             len(base_tasks),
             byte_required,
+            token_required,
             chunk_required,
             complexity_required,
         )
         allocated = min(self.max_workers, desired)
 
         reasons: list[str] = [f"默认至少 {self.default_agents} 个"]
-        if byte_required > self.default_agents:
+        if source_scaling and byte_required > self.default_agents:
             reasons.append(
                 f"索引文本 {indexed_bytes} Bytes 按 {target_shard_bytes} Bytes 目标分片需要 {byte_required} 个"
             )
-        if chunk_required > self.default_agents:
+        if source_scaling and token_required > self.default_agents:
+            reasons.append(f"索引文本约 {indexed_tokens} Token 需要 {token_required} 个安全分片")
+        if source_scaling and chunk_required > self.default_agents:
             reasons.append(f"{len(chunks)} 个检索块需要 {chunk_required} 个")
         if complexity_required > self.default_agents:
             reasons.append(f"任务复杂度需要 {complexity_required} 个")
@@ -393,18 +435,25 @@ class MultiAgentResearchSystem:
 
         allocated_tasks: list[dict[str, Any]] = []
         chunk_count = len(chunks)
+        shard_ranges = self._balanced_token_shards(chunks, allocated if source_scaling else 1)
+        combined_targets = list(dict.fromkeys(
+            str(task.get("objective", "")).strip()
+            for task in source_tasks
+            if str(task.get("objective", "")).strip()
+        ))
+        combined_source_query = "\n".join(dict.fromkeys(
+            str(task.get("query", "")).strip()
+            for task in source_tasks
+            if str(task.get("query", "")).strip()
+        ))
         for slot in range(allocated):
             template = dict(base_tasks[slot % len(base_tasks)])
-            if chunk_count == 0:
+            if not source_scaling or chunk_count == 0:
                 chunk_start = chunk_end = 0
-            elif allocated <= chunk_count:
-                chunk_start = slot * chunk_count // allocated
-                chunk_end = (slot + 1) * chunk_count // allocated
             else:
-                chunk_start = slot % chunk_count
-                chunk_end = chunk_start + 1
+                chunk_start, chunk_end = shard_ranges[slot]
             shard_chunks = chunks[chunk_start:chunk_end]
-            combined_query = str(template.get("query", "")).strip()
+            combined_query = combined_source_query if source_scaling else str(template.get("query", "")).strip()
             if question.casefold() not in combined_query.casefold():
                 combined_query = f"{combined_query}\n总体目标：{question}".strip()
             template.update({
@@ -418,8 +467,36 @@ class MultiAgentResearchSystem:
                 "chunk_end": chunk_end,
                 "shard_chunks": len(shard_chunks),
                 "shard_bytes": sum(chunk.byte_size for chunk in shard_chunks),
+                "shard_tokens": sum(chunk.estimated_tokens for chunk in shard_chunks),
+                "coverage_required": source_scaling,
+                "required_targets": combined_targets if source_scaling else template.get("required_targets", []),
+                "target_queries": [
+                    {"target": task.get("objective", ""), "query": task.get("query", "")}
+                    for task in source_tasks
+                ] if source_scaling else [],
             })
+            if source_scaling:
+                template["source_policy"] = "required"
+                template["tools"] = list(dict.fromkeys([*template.get("tools", []), "source_search"]))
+                template["depends_on"] = []
+                template["phase"] = 0
+                template["agent_instruction"] = (
+                    f"{template.get('agent_instruction', '')} 完整扫描分配到的连续分片，并同时检查："
+                    f"{'；'.join(combined_targets)}。不得用局部未命中推断整份资料不存在。"
+                )[:1_000]
             allocated_tasks.append(template)
+
+        if not source_scaling:
+            generated_by_base: dict[str, list[str]] = {}
+            for task in allocated_tasks:
+                generated_by_base.setdefault(str(task.get("base_task_id", "")), []).append(task["task_id"])
+            for task in allocated_tasks:
+                dependency_ids = [
+                    generated_id
+                    for base_dependency in task.get("depends_on", [])
+                    for generated_id in generated_by_base.get(str(base_dependency), [])
+                ]
+                task["depends_on"] = list(dict.fromkeys(dependency_ids))
 
         self._allocation = {
             "default_agents": self.default_agents,
@@ -427,36 +504,136 @@ class MultiAgentResearchSystem:
             "allocated_agents": allocated,
             "max_agents": self.max_workers,
             "source_indexed_bytes": indexed_bytes,
+            "source_indexed_tokens": indexed_tokens,
             "largest_source_indexed_bytes": self.index.largest_source_indexed_bytes,
             "shard_byte_limit": self.shard_byte_limit,
             "target_shard_bytes": target_shard_bytes,
+            "target_shard_tokens": target_shard_tokens,
             "source_exceeds_shard_limit": self.index.largest_source_indexed_bytes > self.shard_byte_limit,
             "multi_agent_sharding_active": allocated > 1,
             "exhaustive_scan": exhaustive_scan,
+            "source_scaling_active": source_scaling,
+            "required_targets": combined_targets,
             "allocation_reason": "；".join(reasons),
         }
         return allocated_tasks
 
     @staticmethod
+    def _balanced_token_shards(chunks: list[Any], count: int) -> list[tuple[int, int]]:
+        if not chunks or count <= 0:
+            return [(0, 0)] * max(1, count)
+        requested_count = count
+        count = min(count, len(chunks))
+        ranges: list[tuple[int, int]] = []
+        start = 0
+        remaining_tokens = sum(max(1, chunk.estimated_tokens) for chunk in chunks)
+        for slot in range(count):
+            remaining_slots = count - slot
+            if remaining_slots == 1:
+                end = len(chunks)
+            else:
+                target = max(1, math.ceil(remaining_tokens / remaining_slots))
+                used = 0
+                end = start
+                last_allowed = len(chunks) - (remaining_slots - 1)
+                while end < last_allowed and (used < target or end == start):
+                    used += max(1, chunks[end].estimated_tokens)
+                    end += 1
+            shard_tokens = sum(max(1, chunk.estimated_tokens) for chunk in chunks[start:end])
+            ranges.append((start, end))
+            remaining_tokens -= shard_tokens
+            start = end
+        while len(ranges) < requested_count:
+            ranges.append(ranges[len(ranges) % count])
+        return ranges
+
+    @staticmethod
     def _dispatch_active_tasks(state: GraphState):
+        findings_by_task = {
+            str(item.get("task_id", "")): item
+            for item in state.get("findings", [])
+        }
         return [
-            Send("worker", {"question": state["question"], "task": task})
+            Send("worker", {
+                "question": state["question"],
+                "task": task,
+                "dependency_findings": [
+                    MultiAgentResearchSystem._finding_summary(findings_by_task[dependency])
+                    for dependency in task.get("depends_on", [])
+                    if dependency in findings_by_task
+                ],
+            })
             for task in state.get("active_tasks", [])
         ]
 
+    def _dependency_scheduler(self, state: GraphState) -> dict[str, Any]:
+        completed = {
+            str(item.get("task_id", ""))
+            for item in self._deduplicate_findings(state.get("findings", []))
+        }
+        pending = [task for task in state.get("tasks", []) if task["task_id"] not in completed]
+        ready = [
+            task for task in pending
+            if set(task.get("depends_on", [])).issubset(completed)
+        ]
+        phase = state.get("dependency_phase", 0) + (1 if ready else 0)
+        detail = (
+            f"依赖波次 {phase}：调度 {len(ready)} 个就绪任务，剩余 {len(pending) - len(ready)} 个"
+            if ready else f"依赖执行完成：{len(completed)}/{len(state.get('tasks', []))} 个任务已完成"
+        )
+        return {
+            "active_tasks": ready,
+            "dependency_phase": phase,
+            "trace": [{
+                "node": "dependency_scheduler",
+                "role": "依赖调度器",
+                "status": "scheduled" if ready else "completed",
+                "detail": detail,
+                "task_ids": [task["task_id"] for task in ready],
+            }],
+        }
+
+    @staticmethod
+    def _route_dependencies(state: GraphState):
+        if state.get("active_tasks"):
+            return MultiAgentResearchSystem._dispatch_active_tasks(state)
+        return "reducer"
+
     def _dynamic_worker(self, state: DynamicWorkerState) -> dict[str, Any]:
         task = state["task"]
-        hits, retrieval_strategy = self._retrieve_hits(task)
+        hits, retrieval_strategy, retrieval_meta = self._retrieve_hits(task)
         with self._record_lock:
             self._retrieval_strategies.add(retrieval_strategy)
         # input_budget is the maximum safe prompt budget, not a target. Leave room for
         # the generated AgentSpec, current question and bounded conversation context.
         evidence_budget = int(task.get("input_budget", 61_000)) - 4_000
-        evidence_ids, packed = self._pack_evidence(
+        evidence_ids, packed, pack_meta = self._pack_evidence(
             hits,
             budget=max(1_000, evidence_budget),
             task=task,
         )
+        assigned_chunks = int(task.get("shard_chunks", 0))
+        coverage_required = bool(task.get("coverage_required", False))
+        scanned_chunks = int(pack_meta["packed_chunks"]) if coverage_required else 0
+        coverage_complete = bool(
+            not coverage_required
+            or (not pack_meta["truncated"] and scanned_chunks >= assigned_chunks)
+        )
+        coverage = {
+            "required": coverage_required,
+            "complete": coverage_complete,
+            "shard_index": int(task.get("shard_index", 1) or 1),
+            "shard_count": int(task.get("shard_count", 1) or 1),
+            "chunk_start": int(task.get("chunk_start", 0) or 0),
+            "chunk_end": int(task.get("chunk_end", 0) or 0),
+            "assigned_chunks": assigned_chunks,
+            "scanned_chunks": scanned_chunks,
+            "assigned_tokens": int(task.get("shard_tokens", 0) or 0),
+            "packed_tokens": int(pack_meta["packed_tokens"]),
+            "candidate_matches": int(retrieval_meta.get("candidate_matches", 0)),
+            "target_candidates": retrieval_meta.get("target_candidates", {}),
+            "retrieval_strategy": retrieval_strategy,
+        }
         messages = [
             {
                 "role": "system",
@@ -468,8 +645,9 @@ class MultiAgentResearchSystem:
                     f"来源策略：{task.get('source_policy', 'none')}。"
                     "你只处理当前子任务，不知道其他 Worker 的消息，也不能调用未授权工具。"
                     "来源策略为 required 时，事实结论必须引用给定 evidence_id；为 none 时可使用模型通用知识。"
-                    "返回JSON：{\"summary\":...,\"claims\":[...],\"evidence_ids\":[...],"
-                    "\"confidence\":0到1}。不得编造证据ID。"
+                    "返回JSON：{\"summary\":...,\"facts\":[...],\"claims\":[...],"
+                    "\"uncertainties\":[...],\"contradictions\":[...],"
+                    "\"evidence_ids\":[...],\"confidence\":0到1}。不得编造证据ID。"
                 ),
             },
             {
@@ -477,6 +655,11 @@ class MultiAgentResearchSystem:
                 "content": (
                     f"task_id：{task['task_id']}\n目标：{task['objective']}\n"
                     f"工作查询：{task['query']}\n"
+                    + (
+                        "依赖任务的结构化结果：\n"
+                        f"{json.dumps(state.get('dependency_findings', []), ensure_ascii=False)}\n"
+                        if state.get("dependency_findings") else ""
+                    )
                     + (
                         f"有界对话记忆（只用于理解当前问题，不可作为事实证据）：\n"
                         f"{self._conversation_context}\n"
@@ -496,9 +679,12 @@ class MultiAgentResearchSystem:
             item for item in parsed.get("evidence_ids", [])
             if isinstance(item, str) and item in evidence_ids
         ]
-        if not valid_ids:
-            valid_ids = evidence_ids[:3]
         claims = [str(item)[:800] for item in parsed.get("claims", []) if str(item).strip()]
+        facts = [str(item)[:800] for item in parsed.get("facts", []) if str(item).strip()]
+        if not facts:
+            facts = list(claims)
+        uncertainties = [str(item)[:800] for item in parsed.get("uncertainties", []) if str(item).strip()]
+        contradictions = [str(item)[:800] for item in parsed.get("contradictions", []) if str(item).strip()]
         summary = str(parsed.get("summary", "")).strip()
         if not summary:
             summary = (
@@ -515,7 +701,10 @@ class MultiAgentResearchSystem:
             "source_policy": task.get("source_policy", "none"),
             "objective": task["objective"],
             "summary": summary[:1_500],
+            "facts": facts[:12],
             "claims": claims[:8],
+            "uncertainties": uncertainties[:8],
+            "contradictions": contradictions[:8],
             "evidence_ids": valid_ids,
             "confidence": self._confidence(parsed.get("confidence")),
             "retrieval_strategy": retrieval_strategy,
@@ -524,6 +713,12 @@ class MultiAgentResearchSystem:
             "shard_index": task.get("shard_index"),
             "shard_count": task.get("shard_count"),
             "shard_bytes": task.get("shard_bytes"),
+            "shard_tokens": task.get("shard_tokens"),
+            "depends_on": task.get("depends_on", []),
+            "phase": task.get("phase", 0),
+            "required_targets": task.get("required_targets", []),
+            "coverage": coverage,
+            "negative_claim": self._looks_negative(summary),
         }
         finding["artifact_id"] = self.artifacts.put(
             "finding", json.dumps(finding, ensure_ascii=False),
@@ -540,7 +735,7 @@ class MultiAgentResearchSystem:
                     f"独立执行完成；分片={task.get('shard_index', 1)}/{task.get('shard_count', 1)}；"
                     f"工具={','.join(task.get('tools', []))}；分片大小={task.get('shard_bytes', 0)} Bytes；"
                     f"资料策略={retrieval_strategy}；"
-                    f"引用 {len(valid_ids)} 个证据对象"
+                    f"覆盖={scanned_chunks}/{assigned_chunks}；引用 {len(valid_ids)} 个证据对象"
                 ),
                 "artifact_id": finding["artifact_id"],
             }],
@@ -549,10 +744,10 @@ class MultiAgentResearchSystem:
     def _retrieve_hits(
         self,
         task: dict[str, Any],
-    ) -> tuple[list[SearchHit], str]:
+    ) -> tuple[list[SearchHit], str, dict[str, Any]]:
         """Use bounded external context only when the generated Agent requests that tool."""
         if "source_search" not in task.get("tools", []) or not self.index.chunks:
-            return [], "model_reasoning_only"
+            return [], "model_reasoning_only", {"candidate_matches": 0, "target_candidates": {}}
         query = str(task.get("query", ""))
         referential_terms = ("这个", "该内容", "上述", "前面", "刚才", "它", "其", "这些", "他们")
         if self._conversation_context and any(term in query for term in referential_terms):
@@ -564,11 +759,46 @@ class MultiAgentResearchSystem:
         )
         shard_chunks = self.index.all_chunks()[chunk_start:chunk_end]
         compact = re.sub(r"\s+", "", f"{task.get('objective', '')}{query}".casefold())
-        if any(term in compact for term in EXHAUSTIVE_SCAN_TERMS):
-            return [
-                SearchHit(chunk=chunk, score=1.0, source="shard_exhaustive_scan")
-                for chunk in shard_chunks
-            ], "sharded_exhaustive_scan"
+        target_candidates: dict[str, int] = {}
+        candidate_hits: list[SearchHit] = []
+        for target in task.get("target_queries", []):
+            target_name = str(target.get("target", "")).strip()
+            target_query = str(target.get("query", target_name)).strip()
+            if not target_name or not target_query:
+                continue
+            matches = self.index.search(
+                target_query,
+                limit=5,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+            )
+            direct_terms = [
+                re.sub(r"\s+", "", value).casefold()
+                for value in (target_query, target_name)
+                if len(re.sub(r"\s+", "", value)) >= 2
+            ]
+            direct_matches = [
+                hit for hit in matches
+                if any(term in re.sub(r"\s+", "", hit.chunk.text).casefold() for term in direct_terms)
+            ]
+            target_candidates[target_name] = len(direct_matches)
+            candidate_hits.extend(direct_matches)
+
+        if task.get("source_policy") == "required" or task.get("coverage_required"):
+            combined: list[SearchHit] = []
+            seen: set[str] = set()
+            for hit in [
+                *candidate_hits,
+                *(SearchHit(chunk=chunk, score=1.0, source="shard_full_scan") for chunk in shard_chunks),
+            ]:
+                if hit.chunk.chunk_id in seen:
+                    continue
+                seen.add(hit.chunk.chunk_id)
+                combined.append(hit)
+            return combined, "sharded_full_coverage", {
+                "candidate_matches": len({hit.chunk.chunk_id for hit in candidate_hits}),
+                "target_candidates": target_candidates,
+            }
         lexical_hits = self.index.search(
             query,
             limit=7,
@@ -582,12 +812,16 @@ class MultiAgentResearchSystem:
         )
         if not needs_coverage:
             if lexical_hits:
-                return lexical_hits, "sharded_hybrid_exact"
+                return lexical_hits, "sharded_hybrid_exact", {
+                    "candidate_matches": len(lexical_hits), "target_candidates": target_candidates,
+                }
             fallback = [
                 SearchHit(chunk=chunk, score=0.01, source="shard_fallback")
                 for chunk in shard_chunks[:3]
             ]
-            return fallback, "sharded_positional_fallback"
+            return fallback, "sharded_positional_fallback", {
+                "candidate_matches": 0, "target_candidates": target_candidates,
+            }
 
         chunks = shard_chunks
         coverage_hits: list[SearchHit] = []
@@ -621,7 +855,9 @@ class MultiAgentResearchSystem:
             combined.append(hit)
         if not combined and chunks:
             combined = [SearchHit(chunk=chunks[0], score=0.01, source="shard_fallback")]
-        return combined[:10], "sharded_hybrid_plus_positional_coverage"
+        return combined[:10], "sharded_hybrid_plus_positional_coverage", {
+            "candidate_matches": len(lexical_hits), "target_candidates": target_candidates,
+        }
 
     def _pack_evidence(
         self,
@@ -629,14 +865,17 @@ class MultiAgentResearchSystem:
         *,
         budget: int,
         task: dict[str, Any],
-    ) -> tuple[list[str], str]:
+    ) -> tuple[list[str], str, dict[str, Any]]:
         artifact_ids: list[str] = []
         blocks: list[str] = []
         used = 0
+        packed_chunk_ids: list[str] = []
+        truncated = False
         for hit in hits:
             text = hit.chunk.text.strip()
             cost = estimate_tokens(text) + 80
             if blocks and used + cost > budget:
+                truncated = True
                 break
             source = self.index.source_for(hit.chunk.document_name)
             indexed_bytes = int(source.get("indexed_bytes", 0))
@@ -660,8 +899,14 @@ class MultiAgentResearchSystem:
             })
             artifact_ids.append(artifact_id)
             blocks.append(f"[artifact_id={artifact_id}]\n{text}")
+            packed_chunk_ids.append(hit.chunk.chunk_id)
             used += cost
-        return artifact_ids, "\n\n".join(blocks)
+        return artifact_ids, "\n\n".join(blocks), {
+            "packed_chunks": len(packed_chunk_ids),
+            "packed_chunk_ids": packed_chunk_ids,
+            "packed_tokens": used,
+            "truncated": truncated or len(packed_chunk_ids) < len(hits),
+        }
 
     def _reduce_tree(self, state: GraphState) -> dict[str, Any]:
         current = [self._finding_summary(item) for item in self._deduplicate_findings(state["findings"])]
@@ -675,7 +920,10 @@ class MultiAgentResearchSystem:
                 messages = [
                     {"role": "system", "content": (
                         "ROLE:REDUCER。合并一小组动态 Worker 的结构化结论，不读取完整原文。"
-                        "返回JSON：{\"summary\":...,\"claims\":[...],\"evidence_ids\":[...]}。"
+                        "不得删除输入中的事实、未解决项、矛盾或覆盖状态。"
+                        "返回JSON：{\"summary\":...,\"facts\":[...],\"claims\":[...],"
+                        "\"unresolved_questions\":[...],\"contradictions\":[...],"
+                        "\"evidence_ids\":[...]}。"
                     )},
                     {"role": "user", "content": json.dumps(group, ensure_ascii=False)},
                 ]
@@ -685,13 +933,54 @@ class MultiAgentResearchSystem:
                     max_tokens=1_800,
                     required_keys=("summary", "evidence_ids"),
                 )
+                input_facts = list(dict.fromkeys(
+                    str(value)[:800]
+                    for item in group
+                    for value in [*item.get("facts", []), *item.get("claims", [])]
+                    if str(value).strip()
+                ))
+                input_claims = list(dict.fromkeys(
+                    str(value)[:800]
+                    for item in group
+                    for value in item.get("claims", [])
+                    if str(value).strip()
+                ))
+                input_evidence = list(dict.fromkeys(
+                    evidence_id
+                    for item in group
+                    for evidence_id in item.get("evidence_ids", [])
+                    if isinstance(evidence_id, str)
+                ))
+                input_unresolved = list(dict.fromkeys(
+                    str(value)[:800]
+                    for item in group
+                    for value in [*item.get("uncertainties", []), *item.get("unresolved_questions", [])]
+                    if str(value).strip()
+                ))
+                input_contradictions = list(dict.fromkeys(
+                    str(value)[:800]
+                    for item in group
+                    for value in item.get("contradictions", [])
+                    if str(value).strip()
+                ))
                 reduced = {
                     "summary": str(parsed.get("summary") or "；".join(item["summary"] for item in group))[:3_000],
-                    "claims": [str(item)[:800] for item in parsed.get("claims", [])][:20],
-                    "evidence_ids": list(dict.fromkeys(
-                        [item for item in parsed.get("evidence_ids", []) if isinstance(item, str)]
-                        or [evidence_id for item in group for evidence_id in item["evidence_ids"]]
-                    )),
+                    "facts": input_facts[:80],
+                    "claims": list(dict.fromkeys([
+                        *input_claims,
+                        *[str(item)[:800] for item in parsed.get("claims", []) if str(item).strip()],
+                    ]))[:80],
+                    "unresolved_questions": list(dict.fromkeys([
+                        *input_unresolved,
+                        *[str(item)[:800] for item in parsed.get("unresolved_questions", []) if str(item).strip()],
+                    ]))[:40],
+                    "contradictions": list(dict.fromkeys([
+                        *input_contradictions,
+                        *[str(item)[:800] for item in parsed.get("contradictions", []) if str(item).strip()],
+                    ]))[:40],
+                    # Evidence closure is deterministic: the model cannot add or silently drop IDs.
+                    "evidence_ids": input_evidence,
+                    "coverage": self._merge_coverage([item.get("coverage", {}) for item in group]),
                 }
                 reduced["artifact_id"] = self.artifacts.put(
                     "reduction", json.dumps(reduced, ensure_ascii=False), {"level": level}
@@ -702,7 +991,11 @@ class MultiAgentResearchSystem:
                 "detail": f"第 {level} 层：{len(current)} 个输入归并为 {len(next_level)} 个结果",
             })
             current = next_level
-        reduced = current[0] if current else {"summary": "没有动态 Agent 结论。", "claims": [], "evidence_ids": []}
+        reduced = current[0] if current else {
+            "summary": "没有动态 Agent 结论。", "facts": [], "claims": [],
+            "unresolved_questions": [], "contradictions": [], "evidence_ids": [],
+            "coverage": {},
+        }
         return {"reduced": reduced, "trace": trace}
 
     def _validator(self, state: GraphState) -> dict[str, Any]:
@@ -713,13 +1006,17 @@ class MultiAgentResearchSystem:
             {"role": "system", "content": (
                 "ROLE:VALIDATOR。你只做语义质量检查，不能改变工作流或放宽程序规则。"
                 "没有外部资料的通用推理任务可以不含 evidence_id；只有 source_policy=required 的任务必须有证据。"
+                "必须逐项检查 required_targets；当结论声称未找到、不存在或无法提供时，"
+                "只有 coverage.percent=100 且全部分片完成才允许通过。"
                 "返回JSON：{\"semantic_pass\":true/false,\"missing_task_ids\":[...],"
+                "\"missing_required_targets\":[...],\"unsupported_negative_claims\":[...],"
                 "\"contradictions\":[...],\"notes\":...}。"
             )},
             {"role": "user", "content": json.dumps({
                 "tasks": tasks,
                 "findings": [self._finding_summary(item) for item in findings],
                 "hard_validation": hard,
+                "coverage": hard.get("coverage", {}),
             }, ensure_ascii=False)},
         ]
         parsed, response_valid = self._call_json(
@@ -734,7 +1031,15 @@ class MultiAgentResearchSystem:
             if isinstance(item, str) and item in known_ids
         ]
         contradictions = [str(item)[:600] for item in parsed.get("contradictions", [])]
-        semantic_pass = bool(parsed.get("semantic_pass", False)) and not semantic_missing and not contradictions
+        missing_targets = [str(item)[:300] for item in parsed.get("missing_required_targets", []) if str(item).strip()]
+        unsupported_negatives = [str(item)[:600] for item in parsed.get("unsupported_negative_claims", []) if str(item).strip()]
+        semantic_pass = (
+            bool(parsed.get("semantic_pass", False))
+            and not semantic_missing
+            and not contradictions
+            and not missing_targets
+            and not unsupported_negatives
+        )
         semantic_failure_codes: list[str] = []
         if not response_valid:
             semantic_failure_codes.append("validator_invalid_json")
@@ -742,9 +1047,17 @@ class MultiAgentResearchSystem:
             semantic_failure_codes.append("validator_missing_tasks")
         if contradictions:
             semantic_failure_codes.append("validator_contradictions")
+        if missing_targets:
+            semantic_failure_codes.append("missing_required_entity")
+        if unsupported_negatives:
+            semantic_failure_codes.append("unsupported_negative_claim")
         if response_valid and not semantic_pass and not semantic_missing and not contradictions:
             semantic_failure_codes.append("validator_semantic_rejected")
-        retryable = sorted(set(hard["missing_task_ids"] + semantic_missing))
+        retryable = sorted(set(
+            hard["missing_task_ids"]
+            + hard.get("retryable_task_ids", [])
+            + semantic_missing
+        ))
         approved = bool(hard["passed"] and semantic_pass)
         validation = {
             "approved": approved,
@@ -756,6 +1069,8 @@ class MultiAgentResearchSystem:
                 "failure_codes": semantic_failure_codes,
                 "missing_task_ids": semantic_missing,
                 "contradictions": contradictions,
+                "missing_required_targets": missing_targets,
+                "unsupported_negative_claims": unsupported_negatives,
                 "notes": str(parsed.get("notes") or (
                     "Validator 未返回可解析的 JSON。"
                     if not response_valid else "语义检查未返回有效说明。"
@@ -798,6 +1113,17 @@ class MultiAgentResearchSystem:
             evidence_ids = finding.get("evidence_ids", [])
             if task.get("source_policy") == "required" and not evidence_ids:
                 missing.append(task_id)
+            coverage = finding.get("coverage", {})
+            if task.get("coverage_required") and not coverage.get("complete", False):
+                invalid.append(f"insufficient_coverage:{task_id}")
+                missing.append(task_id)
+            if (
+                finding.get("negative_claim")
+                and int(coverage.get("candidate_matches", 0)) > 0
+                and not finding.get("facts")
+            ):
+                invalid.append(f"candidate_ignored:{task_id}")
+                missing.append(task_id)
             for evidence_id in evidence_ids:
                 artifact = self.artifacts.get(str(evidence_id))
                 if artifact is None or artifact.kind != "evidence":
@@ -810,12 +1136,30 @@ class MultiAgentResearchSystem:
         if not reduced_ids.issubset(finding_ids):
             invalid.append("reducer_introduced_unknown_evidence")
         within_budget = all(
-            int(call.get("actual_prompt_tokens") or call["estimated_prompt_tokens"])
-            + OUTPUT_RESERVE + SAFETY_MARGIN <= self.context_limit
+            int(call.get("accounted_total_tokens") or (
+                int(call.get("actual_prompt_tokens") or call["estimated_prompt_tokens"])
+                + int(call.get("reserved_output_tokens", OUTPUT_RESERVE))
+                + SAFETY_MARGIN
+            )) <= self.context_limit
             for call in self._calls
         )
         if not within_budget:
             invalid.append("context_budget_exceeded")
+        coverage_report = self._build_coverage_report(tasks, findings)
+        if coverage_report["required"] and not coverage_report["complete"]:
+            invalid.append("insufficient_coverage")
+        unsupported_negative = bool(
+            coverage_report["negative_claim_count"]
+            and coverage_report["coverage_percent"] < 100
+        )
+        if unsupported_negative:
+            invalid.append("unsupported_negative_claim")
+        unresolved_targets = [
+            item["target"] for item in coverage_report.get("targets", [])
+            if item.get("status") == "unresolved"
+        ]
+        if unresolved_targets:
+            invalid.append("missing_required_entity")
         missing = sorted(set(missing))
         checks = {
             "unique_task_ids": len(task_ids) == len(set(task_ids)) and all(task_ids),
@@ -823,12 +1167,89 @@ class MultiAgentResearchSystem:
             "artifacts_and_evidence_valid": not invalid,
             "reducer_evidence_closed": "reducer_introduced_unknown_evidence" not in invalid,
             "all_calls_within_context_limit": within_budget,
+            "source_coverage_complete": not coverage_report["required"] or coverage_report["complete"],
+            "negative_claims_supported": not unsupported_negative,
+            "required_targets_resolved": not unresolved_targets,
         }
         return {
             "passed": all(bool(value) for value in checks.values()),
             "checks": checks,
             "missing_task_ids": missing,
             "violations": invalid,
+            "retryable_task_ids": missing,
+            "unresolved_targets": unresolved_targets,
+            "coverage": coverage_report,
+        }
+
+    def _build_coverage_report(
+        self,
+        tasks: list[dict[str, Any]],
+        findings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        required_tasks = [task for task in tasks if task.get("coverage_required")]
+        findings_by_task = {str(item.get("task_id", "")): item for item in findings}
+        covered_indices: set[int] = set()
+        shards: list[dict[str, Any]] = []
+        target_candidates: dict[str, int] = {}
+        target_support: dict[str, int] = {}
+        negative_count = 0
+        for task in required_tasks:
+            finding = findings_by_task.get(str(task.get("task_id", "")), {})
+            coverage = finding.get("coverage", {})
+            complete = bool(coverage.get("complete", False))
+            start = int(task.get("chunk_start", 0) or 0)
+            end = int(task.get("chunk_end", start) or start)
+            if complete:
+                covered_indices.update(range(start, end))
+            negative = bool(finding.get("negative_claim"))
+            negative_count += int(negative)
+            facts = [str(item) for item in finding.get("facts", []) if str(item).strip()]
+            for target, count in coverage.get("target_candidates", {}).items():
+                target_candidates[str(target)] = target_candidates.get(str(target), 0) + int(count or 0)
+                if int(count or 0) > 0 and facts and not negative:
+                    target_support[str(target)] = target_support.get(str(target), 0) + 1
+            shards.append({
+                "task_id": task.get("task_id"),
+                "shard_index": int(task.get("shard_index", 1) or 1),
+                "shard_count": int(task.get("shard_count", 1) or 1),
+                "complete": complete,
+                "assigned_chunks": int(task.get("shard_chunks", 0) or 0),
+                "scanned_chunks": int(coverage.get("scanned_chunks", 0) or 0),
+                "assigned_tokens": int(task.get("shard_tokens", 0) or 0),
+                "packed_tokens": int(coverage.get("packed_tokens", 0) or 0),
+                "candidate_matches": int(coverage.get("candidate_matches", 0) or 0),
+            })
+        total_chunks = len(self.index.chunks) if required_tasks else 0
+        percent = round(len(covered_indices) / max(1, total_chunks) * 100, 2) if required_tasks else 100.0
+        targets = []
+        for target in self._allocation.get("required_targets", []):
+            candidates = target_candidates.get(str(target), 0)
+            supporting = target_support.get(str(target), 0)
+            if supporting:
+                status = "resolved"
+            elif candidates and percent >= 100:
+                status = "unresolved"
+            elif percent >= 100:
+                status = "not_found_after_full_coverage"
+            else:
+                status = "coverage_incomplete"
+            targets.append({
+                "target": str(target),
+                "candidate_matches": candidates,
+                "supporting_findings": supporting,
+                "status": status,
+            })
+        return {
+            "required": bool(required_tasks),
+            "complete": bool(not required_tasks or (percent >= 100 and all(item["complete"] for item in shards))),
+            "coverage_percent": percent,
+            "document_chunks": total_chunks,
+            "covered_chunks": len(covered_indices),
+            "completed_shards": sum(item["complete"] for item in shards),
+            "total_shards": len(shards),
+            "negative_claim_count": negative_count,
+            "targets": targets,
+            "shards": sorted(shards, key=lambda item: item["shard_index"]),
         }
 
     def _route_after_validation(self, state: GraphState) -> str:
@@ -858,10 +1279,7 @@ class MultiAgentResearchSystem:
         active = state.get("active_tasks", [])
         if not active:
             return "finalizer"
-        return [
-            Send("worker", {"question": state["question"], "task": task})
-            for task in active
-        ]
+        return MultiAgentResearchSystem._dispatch_active_tasks(state)
 
     def _finalize(self, state: GraphState) -> dict[str, Any]:
         validation = state.get("validation", {})
@@ -870,6 +1288,8 @@ class MultiAgentResearchSystem:
                 "ROLE:FINALIZER。根据动态 Agent 的归并结果和 Validator 报告直接回答用户问题。"
                 "对于带 evidence_id 的外部事实必须忠于证据；对于 source_policy=none 的任务可以使用"
                 "模型通用知识。不要把没有外部来源的通用答案错误描述为资料缺失。"
+                "必须逐项回答 required_targets；如果 Validator 标记覆盖不完整、目标未解决或负向结论"
+                "缺乏全覆盖证明，必须明确说明未通过原因，不能声称资料中不存在。"
                 "验证未通过时说明具体缺口后，仍应回答现有结果能够支持的部分。"
             )},
             {"role": "user", "content": (
@@ -893,21 +1313,40 @@ class MultiAgentResearchSystem:
         }
 
     def _call(self, role: str, messages: list[dict[str, str]], *, max_tokens: int) -> str:
-        estimated = estimate_messages_tokens(messages)
-        role_budget = min(self.ROLE_BUDGETS[role], self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN)
-        if estimated > role_budget:
-            raise ValueError(f"{role} Agent 输入约 {estimated} Token，超过其 {role_budget} Token 独立预算")
+        counter = getattr(self.model, "count_messages_tokens", None)
+        if callable(counter):
+            preflight = int(counter(messages))
+            preflight_source = "model_tokenizer"
+        else:
+            preflight = estimate_messages_tokens(messages)
+            preflight_source = "conservative_estimate"
+        reserved_output = max(OUTPUT_RESERVE, int(max_tokens))
+        role_budget = min(self.ROLE_BUDGETS[role], self.context_limit - reserved_output - SAFETY_MARGIN)
+        if preflight > role_budget:
+            raise ValueError(f"{role} Agent 输入约 {preflight} Token，超过其 {role_budget} Token 独立预算")
         with self._model_lock:
             response = self.model.chat(messages, temperature=0.1, max_tokens=max_tokens)
             usage = getattr(self.model, "last_usage", None)
         actual = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        completion = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        measured_prompt = int(actual if actual is not None else preflight)
         with self._record_lock:
             self._calls.append({
                 "role": role,
-                "estimated_prompt_tokens": estimated,
+                "estimated_prompt_tokens": preflight,
                 "actual_prompt_tokens": actual,
                 "accounting_source": "api" if actual is not None else "estimate",
+                "preflight_source": preflight_source,
                 "role_budget": role_budget,
+                "requested_output_tokens": int(max_tokens),
+                "reserved_output_tokens": reserved_output,
+                "actual_completion_tokens": completion,
+                "safety_margin_tokens": SAFETY_MARGIN,
+                "accounted_total_tokens": measured_prompt + reserved_output + SAFETY_MARGIN,
+                "window_utilization_percent": round(
+                    (measured_prompt + reserved_output + SAFETY_MARGIN) / self.context_limit * 100,
+                    2,
+                ),
             })
         return response
 
@@ -945,16 +1384,29 @@ class MultiAgentResearchSystem:
         valid = repaired is not None and all(key in repaired for key in required_keys)
         return (repaired or {}), valid
 
-    def _context_metrics(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    def _context_metrics(
+        self,
+        tasks: list[dict[str, Any]],
+        findings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         def measured(call: dict[str, Any]) -> int:
             return int(call.get("actual_prompt_tokens") or call["estimated_prompt_tokens"])
 
         max_prompt = max((measured(call) for call in self._calls), default=0)
+        max_accounted_total = max(
+            (int(call.get("accounted_total_tokens", 0)) for call in self._calls),
+            default=0,
+        )
         by_role: dict[str, dict[str, int]] = {}
         for call in self._calls:
-            bucket = by_role.setdefault(call["role"], {"calls": 0, "max_prompt_tokens": 0})
+            bucket = by_role.setdefault(call["role"], {
+                "calls": 0, "max_prompt_tokens": 0, "max_accounted_total_tokens": 0,
+            })
             bucket["calls"] += 1
             bucket["max_prompt_tokens"] = max(bucket["max_prompt_tokens"], measured(call))
+            bucket["max_accounted_total_tokens"] = max(
+                bucket["max_accounted_total_tokens"], int(call.get("accounted_total_tokens", 0)),
+            )
         dynamic_agent_counts: dict[str, int] = {}
         for task in tasks:
             agent_name = str(task.get("agent_name") or "未命名 Agent")
@@ -966,8 +1418,14 @@ class MultiAgentResearchSystem:
             "hard_safe_input_tokens": self.context_limit - OUTPUT_RESERVE - SAFETY_MARGIN,
             "max_single_agent_prompt_tokens": max_prompt,
             "max_window_utilization_percent": round(max_prompt / self.context_limit * 100, 2),
+            "max_accounted_total_tokens": max_accounted_total,
+            "max_total_window_utilization_percent": round(
+                max_accounted_total / self.context_limit * 100, 2
+            ),
             "all_agent_calls_within_limit": all(
-                measured(call) + OUTPUT_RESERVE + SAFETY_MARGIN <= self.context_limit
+                int(call.get("accounted_total_tokens") or (
+                    measured(call) + int(call.get("reserved_output_tokens", OUTPUT_RESERVE)) + SAFETY_MARGIN
+                )) <= self.context_limit
                 for call in self._calls
             ),
             "isolated_worker_contexts": True,
@@ -992,6 +1450,19 @@ class MultiAgentResearchSystem:
             "structured_output_retries": self._json_retries,
             "retrieval_strategies": sorted(self._retrieval_strategies),
             "agent_allocation": dict(self._allocation),
+            "dependency_phases": max((int(task.get("phase", 0)) for task in tasks), default=0) + 1,
+            "coverage_report": self._build_coverage_report(tasks, findings),
+            "token_accounting": {
+                "mode": (
+                    "api_usage" if self._calls and all(call.get("actual_prompt_tokens") is not None for call in self._calls)
+                    else "mixed" if any(call.get("actual_prompt_tokens") is not None for call in self._calls)
+                    else "estimated"
+                ),
+                "api_measured_calls": sum(call.get("actual_prompt_tokens") is not None for call in self._calls),
+                "estimated_calls": sum(call.get("actual_prompt_tokens") is None for call in self._calls),
+                "output_reserve_tokens": OUTPUT_RESERVE,
+                "safety_margin_tokens": SAFETY_MARGIN,
+            },
             "conversation_memory": {
                 "enabled": bool(self._conversation_context),
                 "characters": len(self._conversation_context),
@@ -1034,9 +1505,42 @@ class MultiAgentResearchSystem:
             "tools": finding.get("tools", [])[:8],
             "source_policy": finding.get("source_policy", "none"),
             "summary": str(finding.get("summary", ""))[:1_500],
+            "facts": finding.get("facts", [])[:12],
             "claims": finding.get("claims", [])[:8],
+            "uncertainties": finding.get("uncertainties", [])[:8],
+            "contradictions": finding.get("contradictions", [])[:8],
             "evidence_ids": finding.get("evidence_ids", [])[:12],
+            "depends_on": finding.get("depends_on", [])[:16],
+            "phase": finding.get("phase", 0),
+            "required_targets": finding.get("required_targets", [])[:16],
+            "coverage": {
+                key: value for key, value in finding.get("coverage", {}).items()
+                if key != "packed_chunk_ids"
+            },
         }
+
+    @staticmethod
+    def _merge_coverage(items: list[dict[str, Any]]) -> dict[str, Any]:
+        required_items = [item for item in items if item.get("required")]
+        if not required_items:
+            return {"required": False, "complete": True, "coverage_percent": 100.0}
+        assigned = sum(int(item.get("assigned_chunks", 0) or 0) for item in required_items)
+        scanned = sum(int(item.get("scanned_chunks", 0) or 0) for item in required_items)
+        return {
+            "required": True,
+            "complete": all(item.get("complete", False) for item in required_items),
+            "coverage_percent": round(scanned / max(1, assigned) * 100, 2),
+            "assigned_chunks": assigned,
+            "scanned_chunks": scanned,
+        }
+
+    @staticmethod
+    def _looks_negative(text: str) -> bool:
+        compact = re.sub(r"\s+", "", str(text).casefold())
+        return any(term in compact for term in (
+            "未找到", "不存在", "不包含", "没有发现", "无法提供", "无法确定", "缺少相关",
+            "notfound", "doesnotcontain", "cannotprovide", "noevidence",
+        ))
 
     @staticmethod
     def _deduplicate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:

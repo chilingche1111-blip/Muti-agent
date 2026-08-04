@@ -106,6 +106,9 @@ HARD_CHECK_LABELS = {
     "artifacts_and_evidence_valid": "Finding 或 Evidence Artifact 无效",
     "reducer_evidence_closed": "Reducer 引入了动态 Agent 未提供的证据",
     "all_calls_within_context_limit": "至少一次 Agent 调用超过上下文安全预算",
+    "source_coverage_complete": "必需来源任务没有完成全部分片扫描",
+    "negative_claims_supported": "负向结论缺少100%覆盖证明",
+    "required_targets_resolved": "至少一个必答目标仍未解决",
 }
 
 
@@ -160,6 +163,8 @@ def explain_case_failure(result: dict[str, Any], missing_terms: list[str]) -> li
             "validator_missing_tasks": "Validator 判断部分任务结论缺失",
             "validator_contradictions": "Validator 检测到结论或证据矛盾",
             "validator_semantic_rejected": "Validator 语义质量检查未通过",
+            "missing_required_entity": "至少一个必答目标没有得到回答",
+            "unsupported_negative_claim": "未找到或不存在的结论缺少全覆盖证明",
         }
         detail_parts = []
         if semantic.get("missing_task_ids"):

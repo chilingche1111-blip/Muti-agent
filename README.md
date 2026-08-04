@@ -44,46 +44,65 @@ Agent 可以只使用模型原生推理，也可以按任务需要使用上传�
 | 动态 Agent 生成 | 根据当前问题即时生成 Agent 名称、任务指令、能力、工具和来源策略 |
 | 通用问题处理 | 无需上传资料即可使用多个隔离 Agent 完成分析、创作、规划、编程思路等任务 |
 | 可选外部能力 | 按任务需要使用上传资料、网络来源或后续扩展的业务工具 |
-| 长上下文任务 | 通过任务分治、有界输入和分层归并处理大规模信息 |
+| 长上下文任务 | 通过依赖分解、Token 均衡分片、全分片覆盖和分层归并处理大规模信息 |
 | 证据追踪 | 使用证据标识连接原始资料、中间产物和最终结果 |
-| 质量验证 | 对结构、引用、完整性、冲突和语义一致性进行检查 |
+| 质量验证 | 将容量、资料覆盖和答案正确性分成三道独立门禁，防止“调用未越界”被误当成“答案正确” |
 | 容量治理 | 根据任务和资料规模自动分配 Agent，并为调用、分片和中间产物设置独立预算 |
 | 来源可观察性 | 展示来源文件、索引文本、证据块的字节大小及其分片归属 |
 
-## 主界面实测截图
+## 产品使用与实测截图
 
-以下截图来自主界面的真实运行，不是静态设计稿。测试时载入仓库内置的 `enterprise_research_128k.md`：索引文本约 559.1 KB、估算 177,419 Token、共 1,101 个资料块，整体规模明显超过单模型 64K 窗口。运行参数为默认至少 3 个 Agent、最多 16 个 Agent。
+以下图片均来自本地产品实际运行，不是静态设计稿。测试资料为仓库内置的 `enterprise_research_128k.md`：索引文本559.1 KB、估算177,420 Token、共1,101个资料块，整体规模明显超过单模型64K窗口。运行参数为默认至少3个 Agent、最多16个 Agent。
 
-### 多 Agent 自动分配与独立窗口
+### 1. 主界面总览
 
-![主界面多 Agent 调度监控](docs/images/main-ui-multi-agent.jpg)
+![主界面总览](docs/images/main-ui-overview.png)
 
-右侧“Agent 调度视图”用于说明本轮任务如何被分治：
+左侧负责资料与模型配置，中部保留连续对话，Agent 监控和验证中心位于顶部工具区。载入超64K资料后，页面直接显示 Token、资料块、文件字节数和自动分片提示。资料可以保持已索引，但只有获得工具权限的任务才会读取它。
 
-- **默认下限 3 个**：即使任务较小，系统也会保留最低并行数量；
-- **系统需求 9 个**：Supervisor 综合任务规格、资料字节数和资料块数量计算本轮需求；
-- **实际分配 9 个**：需求未超过配置上限，因此生成 9 个相互隔离的 Worker 实例；
-- **配置上限 16 个**：防止 Agent 数量和模型调用数无限增长；
-- **容量占用 56%**：表示本轮使用了 9/16 的可配置 Agent 容量，不是 Token 窗口占用率；
-- **运行时生成的 Agent**：名称、目标、指令、能力和工具均由 Supervisor 针对当前问题生成，不来自预制业务角色表；
-- **独立 64K 窗口 / 安全输入 61,000 Token**：每个 Worker 单独计算预算；64K 中预留 2,000 Token 输出空间和 1,000 Token 安全余量；
-- **Tree Reducer 与 Validator**：Worker 完成后先分层归并，再进行硬规则和语义双层验证。
+### 2. 动态 Agent、全分片覆盖与三道门禁
 
-左侧同时显示了本轮资料规模和分片提示。完整资料仍保存在窗口外，Worker 只接收自己的任务、授权工具和预算内的分片，因此不会把 177,419 Token 一次塞入某个模型请求。
+![动态 Agent 调度与覆盖率](docs/images/main-ui-agent-coverage.png)
 
-### LLM 回答与验证结果
+这张图展示本轮实际分配9个运行时 Agent：
 
-![主界面 LLM 最终回答](docs/images/main-ui-llm-answer.jpg)
+- **3 → 9 / 16**：默认下限为3个，系统根据工作量计算需要9个，未超过16个配置上限；
+- **容量门禁通过**：最重调用的输入、输出预留和安全余量没有超过64K；
+- **覆盖门禁通过**：9个分片全部完成，1,101 / 1,101个资料块已扫描，覆盖率100%；
+- **答案门禁拒绝**：模型没有正确整合全部目标，因此 Validator 明确拒绝，而不是把“未超窗”误判成“答案正确”；
+- **API 实测 Token**：本轮网关返回 usage，面板显示的容量数据不是仅靠字符数推算。
 
-第二张截图展示正常的 LLM 问答能力。该问题要求模型生成产品介绍，系统完成 16 次有界模型调用，并输出一段包含 Supervisor、动态 Agent、独立 64K 窗口、Tree Reducer 和 Validator 的回答。界面中的关键含义如下：
+容量、覆盖和答案是三个相互独立的结论。前两项通过不能覆盖第三项失败，这正是新版 Validator 修复的核心。
 
-- **动态多 Agent 回答**：本轮经过 Supervisor 规划、Worker 执行和 Tree Reducer 归并，不是预制文本；
-- **0 条来源**：本轮只使用模型原生生成能力，没有强制套用文档检索，说明 RAG 是可选工具而不是固定入口；
-- **16 次模型调用**：统计本轮 Supervisor、Worker、Reducer、Validator 和 Finalizer 的有界调用总数；
-- **Validator 通过**：硬规则与语义检查均通过后，Finalizer 才将回答交给用户；
-- **177,419 Token 文档仍保持已索引**：窗口外资料可以继续存在，但不需要资料的 Agent 不会把全文塞进 Prompt。
+### 3. 真实 LLM 回答与失败保护
 
-这两张图分别证明了“如何分工”和“如何回答”：多 Agent 机制没有替代底层 LLM 的通用能力，而是在复杂任务中为它增加可控的任务分解、上下文隔离、分层汇总和验证闭环。
+![真实 LLM 回答与 Validator 状态](docs/images/main-ui-llm-validation.png)
+
+真实企业模型成功提取了项目代号和中期口令，但遗漏了最终归档校验值。回答顶部显示 `Validator 拒绝`，最终文本同时保留已提取内容和验证缺口，便于用户判断是否重试或调整任务。该截图说明多 Agent 编排没有移除原始 LLM 的生成能力，同时也不会允许模型用流畅文本掩盖答案不完整。
+
+![真实 LLM 回答正文](docs/images/main-ui-llm-answer.png)
+
+回答正文进一步解释 Supervisor 分片、Worker 扫描、Tree Reducer 归并和 Validator 检查过程。长文本位于独立可滚动回答区域，不会锁死整个页面。
+
+### 4. 来源、字节大小与分片归属
+
+![来源证据与分片信息](docs/images/main-ui-sources.png)
+
+“外部来源”默认收起并位于回答前方。展开后可查看文件大小、索引大小、证据块字节数、Evidence ID、Agent 分片编号和原文摘录。来源卡片的作用是审计可选工具结果；不使用外部来源的创作、规划或推理任务不会显示这一区域。
+
+### 5. 上下文隔离与执行详情
+
+![上下文隔离与执行详情](docs/images/main-ui-execution-details.png)
+
+执行详情给出完整资料规模、最大单次 Prompt、64K占用比例、模型调用次数和 Agent Loop 轨迹。图中完整资料为177,420 Token，而最大单次 Prompt 为19,186 Token，说明系统处理的是超过窗口的**整体任务**，没有让任何单次调用突破模型物理上限。
+
+### 6. 受权限保护的验证中心
+
+![验证中心运行设置](docs/images/test-center-setup.png)
+
+验证中心与正式问答分离，需要 tester 权限进入。它提供离线确定性验收和真实 API 验收，允许设置最大动态 Agent、Reducer 扇入和最大重规划次数，并从结果概览、容量分析和用例审计三个视图检查64K+任务。
+
+这些截图共同覆盖产品的主要使用路径：载入或不载入外部对象、提出通用任务、动态生成 Agent、查看调度、检查来源、阅读回答，以及独立执行工程验收。RAG 只是可选工具能力之一，通用多 Agent Agentic Loop 才是产品主体。
 
 ## 工作原理
 
@@ -93,40 +112,42 @@ Agent 可以只使用模型原生推理，也可以按任务需要使用上传�
 
 ```mermaid
 flowchart TB
-    INPUT["用户问题 + 有界会话记忆"] --> S["① Supervisor / Agent Factory<br/>识别问题类型并生成 AgentSpec"]
-    S --> SPEC["每个 AgentSpec<br/>name + instruction + capabilities<br/>tools + source_policy + budget"]
-    SPEC --> P["② 容量规划<br/>综合默认下限、任务数、输入规模与复杂度<br/>计算本轮 Worker 数 N"]
-    P --> D["③ LangGraph Send<br/>把 AgentSpec 注入通用 Worker 实例"]
+    INPUT["用户目标 + 有界会话记忆<br/>可选外部对象引用"] --> S["① Supervisor / Agent Factory<br/>识别任务类型、约束和完成标准"]
+    S --> DAG["② 动态任务 DAG<br/>生成 AgentSpec、depends_on<br/>工具权限与独立64K预算"]
+    DAG --> CAP["③ 容量规划<br/>默认下限 + 任务复杂度 + 可并行工作量<br/>计算本轮通用 Worker 数 N"]
+    CAP --> READY["④ 依赖调度器<br/>选择当前所有 Ready 任务并行派发"]
 
-    D --> W1["Worker 1<br/>运行时身份 A + 独立上下文"]
-    D --> W2["Worker 2<br/>运行时身份 B + 独立上下文"]
-    D --> WN["Worker N<br/>按任务与输入规模动态增加"]
+    READY --> W1["Worker 1<br/>运行时职责 A<br/>独立上下文与状态"]
+    READY --> W2["Worker 2<br/>运行时职责 B<br/>独立上下文与状态"]
+    READY --> WN["Worker N<br/>按问题动态扩展"]
 
-    TOOLS[("可选能力层<br/>模型推理 / 上传资料 / 网络来源")] -. "只开放 AgentSpec 授权的工具" .-> W1
-    TOOLS -.-> W2
-    TOOLS -.-> WN
+    TOOLBOX[("可选工具箱<br/>模型推理 / 文档与网页<br/>代码与数据 / 企业业务工具")] -. "按 AgentSpec 最小授权" .-> W1
+    TOOLBOX -.-> W2
+    TOOLBOX -.-> WN
 
-    W1 --> A["④ Artifact Store<br/>保存 Finding、工具结果和可选证据 ID"]
-    W2 --> A
-    WN --> A
-    A --> R["⑤ Tree Reducer<br/>每次最多合并固定数量的 Finding<br/>逐层归并，不重新读取完整原文"]
-    R --> V["⑥ Validator<br/>程序硬校验 + LLM 语义校验"]
-    V --> G{"是否满足结束条件？"}
+    W1 --> STORE["⑤ Artifact Store / 结构化状态<br/>Finding、草稿、代码结果、事实账本<br/>冲突、不确定项与对象引用"]
+    W2 --> STORE
+    WN --> STORE
+    STORE --> MORE{"DAG 中还有 Ready 任务？"}
+    MORE -->|"有"| READY
+    MORE -->|"无"| R["⑥ Tree Reducer<br/>固定扇入、逐层归并结构化产物"]
+    R --> V["⑦ Validator<br/>程序契约 + LLM 语义质量检查"]
+    V --> G{"完成标准全部满足？"}
 
-    G -->|"全部通过"| F["⑧ Finalizer<br/>基于归并结果、引用和验证报告生成回答"]
-    G -->|"有可修复任务<br/>且未达到重试上限"| RP["⑦ Supervisor Replan<br/>只保留失败的 task_id"]
-    RP -->|"进入下一轮"| D
-    G -->|"不可修复或达到循环上限"| F
+    G -->|"是"| F["⑨ Finalizer<br/>生成最终答案或交付物"]
+    G -->|"存在可修复缺口"| RP["⑧ Supervisor Replan<br/>只重建失败任务与必要下游"]
+    RP --> READY
+    G -->|"不可修复或达到上限"| F
 
-    F --> OUTPUT["最终回答 + 引用 + 未解决缺口<br/>运行指标 + Agent 执行轨迹"]
+    F --> OUTPUT["回答 / 报告 / 方案 / 代码 / 创作内容<br/>质量状态 + 执行轨迹 + 可选来源"]
 ```
 
-一次循环从 `Send` 开始，到 Validator 作出判定结束。Validator 通过时进入 Finalizer；验证失败时，只有存在可修复任务且尚未达到 `max_replans`，LangGraph 才把失败的 `task_id` 送回调度节点。已经通过的任务不会重复执行，原文也不会在 Agent 之间传递。
+一次循环先执行依赖已经满足的任务波次。一个波次结束后，调度器只把结构化产物交给下游任务，例如“先生成十章大纲，再让十个章节 Agent 依据对应大纲写作，最后执行一致性检查”。同一机制也可用于软件设计、经营分析、计划制定和大规模资料处理；区别只是 AgentSpec 和授权工具不同。全部波次完成后才进入 Reducer 和 Validator。Validator 通过时进入 Finalizer；验证失败时，只有存在可修复任务且尚未达到 `max_replans`，LangGraph 才把失败的 `task_id` 送回调度节点。已经通过的任务不会重复执行，完整工作历史也不会在 Agent 之间传递。
 
 | 循环要素 | 系统中的具体含义 |
 |---|---|
 | 循环状态 | Task、Finding、Reduction、Validation、Iteration 和 Artifact 引用 |
-| 循环动作 | 规划 → 并行执行 → 树形归并 → 验证 |
+| 循环动作 | 规划 → 依赖波次执行 → 结构化归并 → 验证 |
 | 反馈信号 | Validator 返回的失败原因与可重试 `task_id` |
 | 重试范围 | 仅重新调度失败任务，不重跑全部 Worker |
 | 结束条件 | 验证通过、没有可重试任务，或达到最大重规划次数 |
@@ -136,24 +157,24 @@ flowchart TB
 
 系统没有修改底层模型的 64K 上限，而是把“所有信息一次输入”改成“多个动态 Agent 的有界调用”。对话、资料、工具结果和中间产物的总量可以超过 64K，但任何单次 LLM 请求仍必须处于模型窗口以内。
 
-每个 Supervisor、动态 Worker、Reducer、Validator 和 Finalizer 都拥有独立的64K物理窗口。系统不会把64K全部分给输入，而是统一保留2,000 Token输出空间和1,000 Token安全余量，因此界面显示的最大安全输入为61,000 Token。61K是上限而不是目标，简单任务仍只使用实际需要的上下文。
+每个 Supervisor、动态 Worker、Reducer、Validator 和 Finalizer 都拥有独立的64K物理窗口。系统不会把64K全部分给输入，而是统一保留至少2,000 Token输出空间和1,000 Token安全余量，因此界面显示的最大安全输入为61,000 Token。调用前使用模型分词器（可用时）或保守估算执行预算检查，调用后优先读取 API 返回的 `usage.prompt_tokens` 与 `usage.completion_tokens` 校正账目。界面同时显示“输入 Token”“输出预留”“安全余量”和“总窗口占用”，而不再只展示 Prompt 估算值。61K是上限而不是目标，简单任务仍只使用实际需要的上下文。
 
 ```mermaid
 flowchart LR
-    TASK["整体任务状态<br/>对话 + 资料 + 工具结果 + 中间产物<br/>总量可以超过 64K"] --> PLAN["Supervisor 按问题拆分职责<br/>生成 N 个 AgentSpec"]
-    PLAN --> PACK["每个 Worker 只接收<br/>子任务 + 独立预算 + 必要上下文"]
-    PACK --> WORKER["Worker LLM 调用"]
-    TOOL["可选工具<br/>资料 / Web / 业务能力"] -. "按需提供有界结果" .-> PACK
-    WORKER --> FINDING["输出短小的结构化 Finding<br/>大对象替换为 Artifact ID"]
-    FINDING --> REDUCE["Reducer LLM 调用<br/>固定扇入、逐层归并少量 Finding"]
-    REDUCE --> FINAL["Finalizer LLM 调用<br/>只读取归并结果与验证报告"]
+    TASK["整体任务状态<br/>对话 + 子目标 + 工具结果 + 中间产物<br/>累计规模可以超过64K"] --> PLAN["Supervisor 构造任务 DAG<br/>生成 N 个运行时 AgentSpec"]
+    PLAN --> PACK["每个 Worker 只接收<br/>当前子任务 + 必要上游产物<br/>独立预算与工具权限"]
+    PACK --> WORKER["通用 Worker LLM 调用"]
+    TOOL["可选能力<br/>模型知识 / 文档与网页<br/>代码与数据 / 企业系统"] -. "仅返回当前任务的有界结果" .-> PACK
+    WORKER --> FINDING["输出结构化 Artifact<br/>大对象保存在窗口外并传递 ID"]
+    FINDING --> REDUCE["Tree Reducer<br/>固定扇入、逐层归并 Artifact"]
+    REDUCE --> FINAL["Validator + Finalizer<br/>只读取归并结果与质量报告"]
 
     LIMIT["统一预算门<br/>输入 Token + 输出预留 + 安全余量 ≤ 64K"] -. "调用前检查" .-> WORKER
     LIMIT -.-> REDUCE
     LIMIT -.-> FINAL
 ```
 
-关键点是将上下文按职责分散，而不是把多个 Agent 的内容重新拼回同一个大 Prompt。Supervisor 只管理 AgentSpec 和状态，Worker 不共享彼此历史，Reducer 只读取结构化 Finding，Finalizer 不接收所有执行过程；大对象、Artifact 和 LangGraph Checkpoint 始终位于模型窗口之外。图中的统一预算门同样应用于 Supervisor 和 Validator 等其他模型节点。
+关键点是将上下文按职责和依赖边界分散，而不是把多个 Agent 的内容重新拼回同一个大 Prompt。Supervisor 只管理 AgentSpec、DAG 和状态，Worker 不共享彼此历史，Reducer 只读取结构化 Artifact，Finalizer 不接收所有执行过程；大对象、Artifact 和 LangGraph Checkpoint 始终位于模型窗口之外。是否使用 RAG 只由具体 AgentSpec 决定，不影响这套通用协作骨架。图中的统一预算门同样应用于 Supervisor 和 Validator 等其他模型节点。
 
 ### 三条执行通道
 
@@ -227,7 +248,7 @@ External Memory
 
 `model_reasoning` 始终可用。只有 AgentSpec 授权 `source_search` 时，Worker 才会访问已上传资料或预先取得的网络来源；`source_policy=none` 的 Agent 完全不依赖检索。
 
-需要外部资料时，系统使用父子结构组织信息，并根据当前子任务构造固定大小的 Evidence Pack。检索是工具层的一种能力，不是系统的中心执行范式。
+需要外部资料时，系统使用父子结构组织信息，并根据当前子任务构造固定大小的 Evidence Pack。普通的可选查找仍可采用相关性检索；当任务要求证明“全文存在什么”“是否不存在某人/某项”或覆盖指定对象时，系统切换为 `sharded_full_coverage`：先按估算 Token 把全文划成连续分片，再让各 Worker 扫描其负责的全部 Chunk。相关性排序只改变分片内证据的阅读顺序，不能把低分 Chunk 从覆盖范围中删除。检索是工具层的一种能力，不是系统的中心执行范式。
 
 ### 自动 Agent 分配与分片
 
@@ -237,8 +258,8 @@ External Memory
 Desired Agents
 = max(
     Default Agents,
-    Source Bytes / Shard Byte Target,
-    Chunk Count / Chunk Target,
+    Source Tokens / 45K Shard Target,
+    Required Target Coverage,
     Task Complexity,
     Planned Agent Specs
   )
@@ -246,11 +267,27 @@ Desired Agents
 Allocated Agents = min(Desired Agents, Max Agents)
 ```
 
-对于不使用外部资料的任务，Worker 按不同 AgentSpec 独立求解；对于需要完整扫描资料的任务，系统使用更小的目标分片。两种情况最终都只向 Reducer 传递结构化 Finding，不传递完整执行上下文。
+只有任务声明 `source_policy=required` 且获得 `source_search` 工具时，资料规模才会扩大 Agent 数；纯创作或普通推理不会因为后台仍索引着大文件而无意义地增加 Worker。对于需要完整扫描资料的任务，系统以约45K Token为目标划分连续分片，为输出和协议保留空间；如受最大 Agent 数限制导致某个 Evidence Pack 被截断，覆盖门禁会直接失败，而不会把不完整扫描伪装成成功。
 
-### 树形归并
+### 任务依赖图
 
-如果一次性合并全部子任务结果，归并阶段仍可能形成过大的 Prompt。系统使用固定扇入的树形 Reducer 分层压缩：
+Supervisor 除了生成 AgentSpec，还可以为任务声明 `depends_on`。程序只接受指向前序任务的依赖并计算 `phase`，从而形成无环任务图。每一波只并行执行当前所有依赖已经满足的任务；下游 Worker 接收上游结构化摘要，而不是上游完整上下文。
+
+```text
+Phase 0: 大纲 Agent
+              │
+Phase 1: 章节 1 Agent  章节 2 Agent ... 章节 10 Agent
+              └──────────────┬───────────────┘
+Phase 2: 连贯性与设定检查 Agent
+                             │
+Phase 3: Tree Reducer + Validator + Finalizer
+```
+
+这使系统既能处理可并行的数据分片，也能处理有先后关系的创作、规划、编码和审查任务。
+
+### 结构化事实账本与树形归并
+
+每个 Worker 不是只返回一段自由文本，而是返回 `facts`、`claims`、`uncertainties`、`contradictions` 和 `evidence_ids`。Reducer 先用程序确定性地合并这些账本字段，保证证据 ID、未解决项和冲突不会被一次 LLM 摘要静默删除；再使用固定扇入的树形 Reducer 进行语义归并：
 
 ```text
 Layer 0: A1  A2  A3  A4  A5  A6
@@ -266,9 +303,9 @@ Layer 2:          C1
 
 Validator 将确定性规则和语义判断分开处理。
 
-**硬规则验证**由程序执行，检查结构契约、必要字段、证据引用、任务状态、上下文预算和循环边界。
+**硬规则验证**由程序执行，检查结构契约、必要字段、证据引用、任务状态、上下文预算、循环边界、全部分片是否扫描、必需对象是否解析，以及否定结论是否建立在完整覆盖之上。
 
-**语义验证**由模型执行，检查目标覆盖、证据支持、矛盾遗漏和不确定性表达。
+**语义验证**由模型执行，检查目标覆盖、证据支持、矛盾遗漏、不确定性表达、缺失对象和无依据的否定结论。
 
 模型判断不能覆盖硬规则结果。只有硬规则与语义验证均满足要求，任务才进入最终输出。
 
@@ -306,7 +343,7 @@ D > L
 max(Iᵢ + Oᵢ + Hᵢ) ≤ L
 ```
 
-实现这一目标依赖八个机制：
+实现这一目标依赖十一个机制：
 
 1. **任务分解**：Supervisor 将整体目标拆成可独立验证的子任务；
 2. **动态生成**：每个子任务获得针对当前问题生成的 AgentSpec；
@@ -314,8 +351,21 @@ max(Iᵢ + Oᵢ + Hᵢ) ≤ L
 4. **隔离**：动态 Worker 不共享无限增长的消息历史；
 5. **外部记忆**：原文和中间产物不保存在模型上下文中；
 6. **有界会话记忆**：界面历史保存在模型窗口之外，后续调用只接收预算内的最近对话；
-7. **树形归并**：大量结果通过固定扇入逐层合并；
-8. **预算控制**：每次调用在执行前检查 Token 和序列化字节规模。
+7. **依赖波次**：只把上游结构化产物交给下游任务，避免长历史级联复制；
+8. **全分片覆盖**：要求全文结论时逐片扫描，不用 Top-K 召回率冒充完整性；
+9. **事实账本**：确定性保留事实、主张、冲突、不确定项和证据标识；
+10. **树形归并**：大量结果通过固定扇入逐层合并；
+11. **真实预算控制**：调用前检查，调用后优先使用 API usage 校正 Token 账目。
+
+### 三道独立验收门禁
+
+| 门禁 | 回答的问题 | 失败示例 |
+|---|---|---|
+| 容量门禁 | 每次调用的输入、输出预留和安全余量是否小于64K？ | 某个分片过大或 Reducer 一次合并过多 |
+| 覆盖门禁 | 要求全文或指定对象时，是否扫描全部负责分片并解析所有必需目标？ | 只检索到首尾，没有扫描中部 |
+| 答案门禁 | 最终主张是否被证据支持，矛盾和不确定性是否正确表达？ | 文档中存在目标，却回答“没有” |
+
+三者必须同时通过。容量通过只证明系统没有超窗，不能证明资料看全了；覆盖通过也不能代替语义正确性。主界面把三项状态分别展示，并给出每个分片、必需目标和失败原因。
 
 因此，系统扩展的是模型可完成的整体任务规模，而不是模型一次能够读取的物理窗口。
 
