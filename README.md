@@ -62,7 +62,7 @@ Agent 可以只使用模型原生推理，也可以按任务需要使用上传�
 
 ### 2. 动态 Agent、全分片覆盖与三道门禁
 
-![动态 Agent 调度与覆盖率](docs/images/main-ui-agent-coverage.png)
+![真实API调用后的动态 Agent 调度与覆盖率](docs/images/api-call-agent-monitor.png)
 
 这张图展示本轮实际分配9个运行时 Agent：
 
@@ -74,25 +74,25 @@ Agent 可以只使用模型原生推理，也可以按任务需要使用上传�
 
 容量、覆盖和答案是三个相互独立的结论。前两项通过不能覆盖第三项失败，这正是新版 Validator 修复的核心。
 
-### 3. 真实 LLM 回答与失败保护
+![真实API任务的动态Worker卡片](docs/images/api-call-agent-workers.png)
 
-![真实 LLM 回答与 Validator 状态](docs/images/main-ui-llm-validation.png)
+继续向下滚动监控抽屉，可以逐个查看运行时生成的 Worker 名称、子目标、资料分片、估算 Token、独立64K预算、能力标签、授权工具、依赖关系和执行波次。这些 Agent 来自本轮 Supervisor 规划，不是预制业务角色。
 
-真实企业模型成功提取了项目代号和中期口令，但遗漏了最终归档校验值。回答顶部显示 `Validator 拒绝`，最终文本同时保留已提取内容和验证缺口，便于用户判断是否重试或调整任务。该截图说明多 Agent 编排没有移除原始 LLM 的生成能力，同时也不会允许模型用流畅文本掩盖答案不完整。
+### 3. 真实企业 API 的 LLM 回答与失败保护
 
-![真实 LLM 回答正文](docs/images/main-ui-llm-answer.png)
+![真实企业API的LLM回答与Validator状态](docs/images/api-call-final-answer.png)
 
-回答正文进一步解释 Supervisor 分片、Worker 扫描、Tree Reducer 归并和 Validator 检查过程。长文本位于独立可滚动回答区域，不会锁死整个页面。
+该图来自主界面中已经配置的企业 Chat Completions 兼容 API，不是离线测试模型。真实企业模型成功提取了项目代号和中期口令，但遗漏了最终归档校验值。回答顶部显示 `Validator 拒绝`，最终文本同时保留已提取内容和验证缺口，便于用户判断是否重试或调整任务。该截图说明多 Agent 编排没有移除原始 LLM 的生成能力，同时也不会允许模型用流畅文本掩盖答案不完整。长文本位于独立可滚动回答区域，不会锁死整个页面。
 
 ### 4. 来源、字节大小与分片归属
 
-![来源证据与分片信息](docs/images/main-ui-sources.png)
+![真实API任务使用的来源证据与分片信息](docs/images/api-call-sources.png)
 
 “外部来源”默认收起并位于回答前方。展开后可查看文件大小、索引大小、证据块字节数、Evidence ID、Agent 分片编号和原文摘录。来源卡片的作用是审计可选工具结果；不使用外部来源的创作、规划或推理任务不会显示这一区域。
 
 ### 5. 上下文隔离与执行详情
 
-![上下文隔离与执行详情](docs/images/main-ui-execution-details.png)
+![真实API调用的上下文隔离与执行详情](docs/images/api-call-execution-details.png)
 
 执行详情给出完整资料规模、最大单次 Prompt、64K占用比例、模型调用次数和 Agent Loop 轨迹。图中完整资料为177,420 Token，而最大单次 Prompt 为19,186 Token，说明系统处理的是超过窗口的**整体任务**，没有让任何单次调用突破模型物理上限。
 
